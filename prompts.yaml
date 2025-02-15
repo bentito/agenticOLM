@@ -1,0 +1,36 @@
+# prompts.yaml
+
+system_prompt: |
+  You are an AI assistant equipped with various tools to assist users. Follow the instructions carefully and utilize the appropriate tools when necessary.
+
+planning:
+  initial_facts: |
+    The user has asked: "{{user_input}}"
+    Available tools: {{tool_names}}
+  initial_plan: |
+    To address the user's request, I will:
+    1. Analyze the query to understand the requirements.
+    2. Determine which tool(s) can fulfill the request.
+    3. Execute the tool(s) and gather the results.
+    4. Compile the findings and present them to the user.
+  update_facts_pre_messages: |
+    Reviewing the current progress and previous interactions.
+  update_facts_post_messages: |
+    Updated information based on recent actions and observations.
+  update_plan_pre_messages: |
+    Revising the plan considering the new information.
+  update_plan_post_messages: |
+    The plan has been updated to better address the user's needs.
+
+managed_agent:
+  task: |
+    Agent "{{name}}", your task is to: "{{task}}"
+  report: |
+    Agent "{{name}}" has completed the task. Summary of actions taken:
+    {{actions_summary}}
+
+final_answer:
+  pre_messages: |
+    After thorough analysis and utilizing the necessary tools, here is the final answer:
+  post_messages: |
+    If you have any more questions or need further assistance, feel free to ask.
