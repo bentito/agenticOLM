@@ -19,12 +19,12 @@ get_weather('London')
 
 system_prompt = """
 <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-Answer the following questions as best you can. You have access to the following tools:
+    Answer the following questions as best you can. You have access to the following tools:
 
 get_weather: Get the current weather in a given location
 
 The way you use the tools is by specifying a json blob.
-Specifically, this json should have an `action` key (with the name of the tool to use) and a `action_input` key (with the input to the tool going here).
+Specifically, this json should have a `action` key (with the name of the tool to use) and a `action_input` key (with the input to the tool going here).
 
 The only values that should be in the "action" field are:
 get_weather: Get the current weather in a given location, args: {"location": {"type": "string"}}
@@ -67,7 +67,6 @@ output = client.chat.completions.create(
     ],
     stream=False,
     max_tokens=200,
-    stop=["Observation:"]
 )
 
 print(output.choices[0].message.content)
