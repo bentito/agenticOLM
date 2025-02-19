@@ -4,13 +4,13 @@ import json
 import subprocess
 from openai import OpenAI
 
-# Instantiate a client. (The API key is read from the environment.)
+# Instantiate the client (ensure your OPENAI_API_KEY is set in your environment)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "<YOUR_OPENAI_API_KEY>"))
 
-MODEL_NAME = "gpt-4-0613"  # Use a model that supports function calling.
+MODEL_NAME = "gpt-4-0613"  # Model supporting function calling
 
 # -------------------------------------------------------------------------
-# KUBECTL SUBCOMMAND WRAPPERS: Each function wraps a specific command.
+# KUBECTL SUBCOMMAND WRAPPERS (ACT functions)
 # -------------------------------------------------------------------------
 def operator_catalog_add(
     name: str,
@@ -50,10 +50,10 @@ def operator_catalog_list(
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-# ... [other subcommand functions remain similar] ...
+# (Other subcommand wrappers would be defined similarly)
 
 def _run_subprocess(cmd):
-    """Run a subprocess command and return its output."""
+    """Helper to execute a command and return output."""
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return result.stdout
@@ -61,7 +61,7 @@ def _run_subprocess(cmd):
         return f"Error executing {' '.join(cmd)}:\n{e.stderr}"
 
 # -------------------------------------------------------------------------
-# DEFINE FUNCTION SCHEMAS FOR OPENAI: Each function schema is a dict.
+# FUNCTION SCHEMAS FOR OPENAI (Descriptions for function calling)
 # -------------------------------------------------------------------------
 FUNCTIONS = [
     {
@@ -93,34 +93,37 @@ FUNCTIONS = [
             },
         },
     },
-    # ... [other function schemas similar to above] ...
+    # ... additional function schemas ...
 ]
 
 # -------------------------------------------------------------------------
-# DISPATCH FUNCTION: Map function call from GPT to our local functions.
+# DISPATCH FUNCTION CALL (ACT step)
 # -------------------------------------------------------------------------
 def dispatch_function_call(func_call):
-    func_name = func_call.name  # Use dot notation on the Pydantic model.
-    args = json.loads(func_call.arguments)  # func_call.arguments is a string.
+    # Use dot notation (the response is now a Pydantic model)
+    func_name = func_call.name
+    args = json.loads(func_call.arguments)
     if func_name == "operator_catalog_add":
         return operator_catalog_add(**args)
     elif func_name == "operator_catalog_list":
         return operator_catalog_list(**args)
-    # ... add elif for each function ...
+    # ... additional function mappings ...
     else:
         return f"Unknown function: {func_name}"
 
 # -------------------------------------------------------------------------
-# INTERACTIVE LOOP: Get user input, have GPT generate a function call if needed.
+# AGENT LOOP: Think, Act, Observe paradigm
 # -------------------------------------------------------------------------
 def main():
     print("Enter your request. (Type 'quit' to exit)")
     conversation = [
         {
             "role": "system",
-            "content": ("You are a Kubernetes Operator assistant. "
-                        "When appropriate, use the provided function calls "
-                        "to execute kubectl operator subcommands."),
+            "content": (
+                "You are a Kubernetes Operator assistant. Follow a Think-Act-Observe loop: "
+                "first think about the request, then act by calling the appropriate function, "
+                "and finally observe its output before replying to the user."
+            ),
         }
     ]
 
@@ -130,28 +133,47 @@ def main():
             print("Bye!")
             break
 
+        # Add the user message
         conversation.append({"role": "user", "content": user_input})
 
-        # Make the API call. Note that we use attribute notation to extract results.
+        # First call: Let GPT think and decide if a function call is needed
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=conversation,
             functions=FUNCTIONS,
-            function_call="auto"
+            function_call="auto"  # GPT decides whether to call a function
         )
-
-        # Instead of subscripting, use dot notation.
         msg = response.choices[0].message
+
+        # Check if the model intends to call a function (Act)
         if msg.function_call:
-            # GPT-4 is calling a function.
-            tool_response = dispatch_function_call(msg.function_call)
-            print(f"\n[Tool output]:\n{tool_response}")
-            conversation.append({"role": "assistant", "content": tool_response})
+            print("\n[THINK] Assistant determined a function call is needed.")
+            print(f"[ACT] Executing function: {msg.function_call.name}")
+
+            # Execute the function call (Act)
+            tool_output = dispatch_function_call(msg.function_call)
+
+            # Append the function call result as an observation
+            observation = {
+                "role": "function",
+                "name": msg.function_call.name,
+                "content": tool_output,
+            }
+            conversation.append(observation)
+            print(f"[OBSERVE] Function output:\n{tool_output}")
+
+            # Now, let the model reflect on the observation and provide a final answer
+            followup_response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=conversation
+            )
+            final_msg = followup_response.choices[0].message.content
+            print(f"\nAssistant: {final_msg}")
+            conversation.append({"role": "assistant", "content": final_msg})
         else:
-            # GPT-4 is returning a normal text answer.
-            assistant_response = msg.content
-            print(f"\nAssistant: {assistant_response}")
-            conversation.append({"role": "assistant", "content": assistant_response})
+            # If no function call is requested, simply output the assistant's answer.
+            print(f"\nAssistant: {msg.content}")
+            conversation.append({"role": "assistant", "content": msg.content})
 
 if __name__ == "__main__":
     main()
