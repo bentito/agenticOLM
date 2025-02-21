@@ -358,13 +358,31 @@ def operator_list_operands_filtered(
 # Helper to execute commands without pipelines.
 # -------------------------------------------------------------------------
 def _run_subprocess(cmd):
-    """Helper to execute a command and return its output."""
-    print(f"[ACT] Executing command: `{' '.join(cmd)}`")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return result.stdout
-    except subprocess.CalledProcessError as e:
-        return f"Error executing {' '.join(cmd)}:\n{e.stderr}"
+    """Execute a command, capturing both stdout and stderr, returning whichever contains the output or error."""
+    command_str = " ".join(cmd)
+    print(f"[ACT] Executing command: `{command_str}`")
+
+    # Run the command without check=True, so we can inspect result manually.
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Combine stdout and stderr in case the CLI tool prints error text to stdout.
+    combined_output = (result.stdout or "") + (result.stderr or "")
+
+    # If returncode != 0, treat it as an error and return the combined output as error text.
+    if result.returncode != 0:
+        error_output = f"Error executing `{command_str}` (exit code {result.returncode}):\n{combined_output}"
+        print(f"[DEBUG] {error_output}")
+        return error_output
+
+    # If command succeeded (exit code 0) but there's still something in stderr, log it as debug.
+    if result.stderr.strip():
+        debug_info = f"[DEBUG] Non-empty stderr on success:\n{result.stderr.strip()}"
+        print(debug_info)
+        # Optionally, you can append this debug info to the returned output or just ignore it.
+        return result.stdout + "\n" + debug_info
+
+    # Otherwise, just return stdout.
+    return result.stdout
 
 # -------------------------------------------------------------------------
 # FUNCTION SCHEMAS FOR OPENAI (Descriptions for function calling)
@@ -689,7 +707,7 @@ def dispatch_function_call(func_call):
         return f"Unknown function: {func_name}"
 
 # -------------------------------------------------------------------------
-# AGENT LOOP: Think, Act, Observe paradigm
+# AGENT LOOP: Think, Act, Observe paradigm with improved prompting for error handling.
 # -------------------------------------------------------------------------
 def main():
     print("Enter your request. (Type 'quit' to exit)")
@@ -699,7 +717,9 @@ def main():
             "content": (
                 "You are a Kubernetes Operator assistant. Follow a Think-Act-Observe loop: "
                 "first think about the request, then act by calling the appropriate function, "
-                "and finally observe its output before replying to the user."
+                "and finally observe its output before replying to the user. "
+                "If a function call returns an error, include the full error details in your observation "
+                "and then decide the best corrective action using the available tools."
             ),
         }
     ]
@@ -713,7 +733,7 @@ def main():
         # Add the user message
         conversation.append({"role": "user", "content": user_input})
 
-        # First call: Let GPT think and decide if a function call is needed
+        # Let GPT decide if a function call is needed.
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=conversation,
@@ -722,24 +742,29 @@ def main():
         )
         msg = response.choices[0].message
 
-        # Check if the model intends to call a function (Act)
         if msg.function_call:
             print("\n[THINK] Assistant determined a function call is needed.")
             print(f"[ACT] Executing function: {msg.function_call.name}")
 
-            # Execute the function call (Act)
+            # Execute the function call and capture its output.
             tool_output = dispatch_function_call(msg.function_call)
-
-            # Append the function call result as an observation (Observe)
-            observation = {
+            print(f"[OBSERVE] Function output:\n{tool_output}")
+            conversation.append({
                 "role": "function",
                 "name": msg.function_call.name,
                 "content": tool_output,
-            }
-            conversation.append(observation)
-            print(f"[OBSERVE] Function output:\n{tool_output}")
+            })
 
-            # Let the model reflect on the observation and provide a final answer
+            # If an error occurred, print the full error for debugging and pass it to the agent.
+            if tool_output.startswith("Error executing"):
+                print(f"[DEBUG] Full error output:\n{tool_output}")
+                # Append the full error output as a debug observation.
+                conversation.append({
+                    "role": "assistant",
+                    "content": f"[DEBUG] Full error output:\n{tool_output}"
+                })
+
+            # Let the model reflect on the entire conversation (including the error details)
             followup_response = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=conversation
@@ -751,6 +776,5 @@ def main():
             # If no function call is requested, simply output the assistant's answer.
             print(f"\nAssistant: {msg.content}")
             conversation.append({"role": "assistant", "content": msg.content})
-
 if __name__ == "__main__":
     main()
