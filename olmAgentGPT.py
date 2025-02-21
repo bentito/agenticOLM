@@ -243,7 +243,7 @@ def operator_uninstall(
     namespace: str = None,
     timeout: str = None,
 ) -> str:
-    """Uninstall an operator (and optionally operands and groups)."""
+    """Uninstall an operator (and optionally its operands and groups)."""
     cmd = ["kubectl", "operator", "uninstall", operator]
     if operand_strategy:
         cmd.extend(["--operand-strategy", operand_strategy])
@@ -287,6 +287,76 @@ def operator_version(
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
+# -------------------------------------------------------------------------
+# Helper to execute shell commands that include pipelines.
+# -------------------------------------------------------------------------
+def _run_shell_command(cmd_str: str) -> str:
+    """Helper to execute a command string using the shell (supports pipelines)."""
+    print(f"[ACT] Executing command: `{cmd_str}`")
+    try:
+        result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, check=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        return f"Error executing {cmd_str}:\n{e.stderr}"
+
+# -------------------------------------------------------------------------
+# FILTERED VERSIONS: Composite commands using grep for filtering output.
+# -------------------------------------------------------------------------
+def operator_catalog_list_filtered(
+    filter_term: str,
+    all_namespaces: bool = False,
+    namespace: str = None,
+    timeout: str = None,
+) -> str:
+    """List installed operator catalogs, filtering the output with grep."""
+    cmd = ["kubectl", "operator", "catalog", "list"]
+    if all_namespaces:
+        cmd.append("-A")
+    if namespace:
+        cmd.extend(["-n", namespace])
+    if timeout:
+        cmd.extend(["--timeout", timeout])
+    cmd_str = " ".join(cmd) + f" | grep {filter_term}"
+    return _run_shell_command(cmd_str)
+
+def operator_list_available_filtered(
+    filter_term: str,
+    catalog: str = None,
+    namespace: str = None,
+    timeout: str = None,
+) -> str:
+    """List operators available to be installed, filtering the output with grep."""
+    cmd = ["kubectl", "operator", "list-available"]
+    if catalog:
+        cmd.extend(["-c", catalog])
+    if namespace:
+        cmd.extend(["-n", namespace])
+    if timeout:
+        cmd.extend(["--timeout", timeout])
+    cmd_str = " ".join(cmd) + f" | grep {filter_term}"
+    return _run_shell_command(cmd_str)
+
+def operator_list_operands_filtered(
+    operator: str,
+    filter_term: str,
+    output: str = None,
+    namespace: str = None,
+    timeout: str = None,
+) -> str:
+    """List operands of an installed operator, filtering the output with grep."""
+    cmd = ["kubectl", "operator", "list-operands", operator]
+    if output:
+        cmd.extend(["-o", output])
+    if namespace:
+        cmd.extend(["-n", namespace])
+    if timeout:
+        cmd.extend(["--timeout", timeout])
+    cmd_str = " ".join(cmd) + f" | grep {filter_term}"
+    return _run_shell_command(cmd_str)
+
+# -------------------------------------------------------------------------
+# Helper to execute commands without pipelines.
+# -------------------------------------------------------------------------
 def _run_subprocess(cmd):
     """Helper to execute a command and return its output."""
     print(f"[ACT] Executing command: `{' '.join(cmd)}`")
@@ -523,6 +593,50 @@ FUNCTIONS = [
             },
         },
     },
+    # --- Added filtered versions ---
+    {
+        "name": "operator_catalog_list_filtered",
+        "description": "List installed operator catalogs, filtering the output with grep.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filter_term": {"type": "string", "description": "Substring to filter output using grep."},
+                "all_namespaces": {"type": "boolean", "description": "List catalogs in all namespaces."},
+                "namespace": {"type": "string", "description": "Namespace scope."},
+                "timeout": {"type": "string", "description": "Time to wait before giving up."},
+            },
+            "required": ["filter_term"],
+        },
+    },
+    {
+        "name": "operator_list_available_filtered",
+        "description": "List operators available to be installed, filtering the output with grep.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filter_term": {"type": "string", "description": "Substring to filter output using grep."},
+                "catalog": {"type": "string", "description": "Catalog to query (optional)."},
+                "namespace": {"type": "string", "description": "Namespace scope."},
+                "timeout": {"type": "string", "description": "Time to wait before giving up."},
+            },
+            "required": ["filter_term"],
+        },
+    },
+    {
+        "name": "operator_list_operands_filtered",
+        "description": "List operands of an installed operator, filtering the output with grep.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operator": {"type": "string", "description": "Operator whose operands to list."},
+                "filter_term": {"type": "string", "description": "Substring to filter output using grep."},
+                "output": {"type": "string", "description": "Output format (e.g., json or yaml)."},
+                "namespace": {"type": "string", "description": "Namespace scope."},
+                "timeout": {"type": "string", "description": "Time to wait before giving up."},
+            },
+            "required": ["operator", "filter_term"],
+        },
+    },
 ]
 
 # -------------------------------------------------------------------------
@@ -564,6 +678,13 @@ def dispatch_function_call(func_call):
         return operator_upgrade(**args)
     elif func_name == "operator_version":
         return operator_version(**args)
+    # --- Dispatch for filtered functions ---
+    elif func_name == "operator_catalog_list_filtered":
+        return operator_catalog_list_filtered(**args)
+    elif func_name == "operator_list_available_filtered":
+        return operator_list_available_filtered(**args)
+    elif func_name == "operator_list_operands_filtered":
+        return operator_list_operands_filtered(**args)
     else:
         return f"Unknown function: {func_name}"
 
