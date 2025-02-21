@@ -6,7 +6,7 @@ from openai import OpenAI
 
 # Instantiate the client (ensure your OPENAI_API_KEY is set)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "<YOUR_OPENAI_API_KEY>"))
-MODEL_NAME = "gpt-4-0613"  # Model supporting function calling
+MODEL_NAME = "gpt-4o-mini-2024-07-18"  # Model supporting function calling and 200K Tokens-Per-Minute (TPM)
 
 # -------------------------------------------------------------------------
 # KUBECTL SUBCOMMAND WRAPPERS (ACT functions)
@@ -289,6 +289,7 @@ def operator_version(
 
 def _run_subprocess(cmd):
     """Helper to execute a command and return its output."""
+    print(f"[ACT] Executing command: `{' '.join(cmd)}`")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return result.stdout
