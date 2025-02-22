@@ -763,8 +763,11 @@ def dispatch_function_call(func_call):
 # -------------------------------------------------------------------------
 # AGENT LOOP: Think, Act, Observe paradigm with improved prompting for error handling.
 # -------------------------------------------------------------------------
+from colorama import init, Fore, Style
+init(autoreset=True)
+
 def main():
-    print("Enter your request. (Type 'quit' to exit)")
+    print(Fore.CYAN + "Enter your request. (Type 'quit' to exit)")
     conversation = [
         {
             "role": "system",
@@ -783,15 +786,13 @@ def main():
     ]
 
     while True:
-        user_input = input("\nUser: ")
+        user_input = input(Fore.GREEN + "\nUser: " + Style.RESET_ALL)
         if user_input.strip().lower() in {"quit", "exit"}:
-            print("Bye!")
+            print(Fore.CYAN + "Bye!")
             break
 
-        # Add the user message
         conversation.append({"role": "user", "content": user_input})
 
-        # Let GPT decide if a function call is needed.
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=conversation,
@@ -801,38 +802,34 @@ def main():
         msg = response.choices[0].message
 
         if msg.function_call:
-            print("\n[THINK] Assistant determined a function call is needed.")
-            print(f"[ACT] Executing function: {msg.function_call.name}")
+            print(Fore.YELLOW + "\n[THINK] " + Style.RESET_ALL + "Assistant determined a function call is needed.")
+            print(Fore.MAGENTA + "[ACT] " + Style.RESET_ALL + f"Executing function: {msg.function_call.name}")
 
-            # Execute the function call and capture its output.
             tool_output = dispatch_function_call(msg.function_call)
-            print(f"[OBSERVE] Function output:\n{tool_output}")
+            print(Fore.BLUE + "[OBSERVE] " + Style.RESET_ALL + f"Function output:\n{tool_output}")
             conversation.append({
                 "role": "function",
                 "name": msg.function_call.name,
                 "content": tool_output,
             })
 
-            # If an error occurred, print the full error for debugging and pass it to the agent.
             if tool_output.startswith("Error executing"):
-                print(f"[DEBUG] Full error output:\n{tool_output}")
-                # Append the full error output as a debug observation.
+                debug_msg = f"[DEBUG] Full error output:\n{tool_output.strip()}"
+                print(Fore.RED + debug_msg + Style.RESET_ALL)
                 conversation.append({
                     "role": "assistant",
-                    "content": f"[DEBUG] Full error output:\n{tool_output}"
+                    "content": debug_msg
                 })
 
-            # Let the model reflect on the entire conversation (including the error details)
             followup_response = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=conversation
             )
             final_msg = followup_response.choices[0].message.content
-            print(f"\nAssistant: {final_msg}")
+            print(Fore.CYAN + "\nAssistant: " + Style.RESET_ALL + f"{final_msg}")
             conversation.append({"role": "assistant", "content": final_msg})
         else:
-            # If no function call is requested, simply output the assistant's answer.
-            print(f"\nAssistant: {msg.content}")
+            print(Fore.CYAN + "\nAssistant: " + Style.RESET_ALL + f"{msg.content}")
             conversation.append({"role": "assistant", "content": msg.content})
 
 
