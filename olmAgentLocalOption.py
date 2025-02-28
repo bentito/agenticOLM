@@ -668,6 +668,8 @@ def main():
         "After executing a function, carefully observe its output — including any error messages. "
         "If the error output is ambiguous or incomplete, ask clarifying questions or suggest additional function calls. "
         "If the error indicates a known corrective action, trigger that corrective function call automatically. "
+        "After executing a function, carefully observe its output—including any error messages—and then produce a natural language summary. "
+        "Do not include any internal function call instructions or JSON in your final answer."
         "Use your knowledge of OLM to correctly interpret queries and provide a final answer summarizing what occurred."
     )
 
