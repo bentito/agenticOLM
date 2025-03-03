@@ -1,4 +1,4 @@
-### Implementing Agent model to make a natual language and helpful UX for Operator Lifecycle Manager (OLM):
+### Implementing Agent model to make a natural language and helpful UX for Operator Lifecycle Manager (OLM):
 
 For now, just look at:
 `olmAgentGPT.py` and `olmAgentLocalOption.py`
