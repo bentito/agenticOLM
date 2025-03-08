@@ -5,7 +5,7 @@ import subprocess
 import argparse
 import sys
 
-from smolagents import CodeAgent, tool
+from smolagents import CodeAgent, tool, OpenAIServerModel, ToolCallingAgent
 from smolagents import HfApiModel, LiteLLMModel
 
 ###############################################################################
@@ -596,17 +596,17 @@ def _run_subprocess(cmd) -> str:
     return result.stdout
 
 ###############################################################################
-# CodeAgent Setup and Main Loop
+# ToolCallingAgent Setup and Main Loop
 ###############################################################################
 def create_agent(model):
     """
-    Creates a CodeAgent with the provided model and operator tools.
+    Creates a ToolCallingAgent with the provided model and operator tools.
 
     Args:
         model: An instance of a callable model (e.g., HfApiModel or LiteLLMModel).
 
     Returns:
-        A CodeAgent instance.
+        A ToolCallingAgent instance.
     """
     tools = [
         operator_catalog_add,
@@ -630,11 +630,11 @@ def create_agent(model):
         operator_list_available_filtered,
         operator_list_operands_filtered,
     ]
-    return CodeAgent(tools=tools, model=model)
+    return ToolCallingAgent(tools=tools, model=model, planning_interval=3)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Kubernetes Operator Assistant Agent (using smolagents CodeAgent)"
+        description="Kubernetes Operator Assistant Agent (using smolagents ToolCallingAgent)"
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--gpt", action="store_true", help="Use OpenAI (LiteLLMModel) for completions")
@@ -647,9 +647,11 @@ def main():
         model = LiteLLMModel(model_id="gpt-4o-mini-2024-07-18")
         print("Using OpenAI completions (LiteLLMModel).")
     elif args.local_llm:
-        # Replace with your desired Hugging Face model ID, e.g., "google/bard" or another.
-        model = HfApiModel(model_id="google/bard")
-        print("Using Hugging Face completions (HfApiModel).")
+        model = OpenAIServerModel(
+            model_id="ibm-granite/granite-3.2-8b-instruct",
+            api_base="http://localhost:8080",
+        )
+        print("Using Locally Served LLM via OpenAIServerModel.")
 
     agent = create_agent(model)
     print("Starting smolagents conversation. Type 'quit' to exit.")
