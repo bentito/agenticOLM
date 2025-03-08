@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 import os
-import json
 import subprocess
 import argparse
-import sys
-
-# Import OpenAI client for GPT-based completions
 from openai import OpenAI
-
-# Import smolagents – the small agents framework
 import smolagents
 
 MODEL_NAME = "gpt-4o-mini-2024-07-18"  # Model supporting function calling and high throughput
