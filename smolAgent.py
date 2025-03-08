@@ -1,50 +1,39 @@
 #!/usr/bin/env python3
 import os
+import json
 import subprocess
 import argparse
-from openai import OpenAI
-import smolagents
+import sys
 
-MODEL_NAME = "gpt-4o-mini-2024-07-18"  # Model supporting function calling and high throughput
+from smolagents import CodeAgent, tool
+from smolagents import HfApiModel, LiteLLMModel
 
-# -------------------------------
-# LLM Wrapper Classes
-# -------------------------------
-class GPTLLM:
-    def __init__(self):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "<YOUR_OPENAI_API_KEY>"))
-    def chat(self, messages, functions=None, function_call="auto"):
-        return self.client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            functions=functions,
-            function_call=function_call
-        )
+###############################################################################
+# Operator Functions (Decorated with @tool)
+###############################################################################
+@tool
+def operator_catalog_add(name: str,
+                         index_image: str,
+                         display_name: str = None,
+                         publisher: str = None,
+                         cleanup_timeout: str = None,
+                         namespace: str = None,
+                         timeout: str = None) -> str:
+    """
+    Adds an operator catalog by executing 'kubectl operator catalog add'.
 
-class LocalLLM:
-    def __init__(self):
-        # Initialize your local LLM here (example using Hugging Face Transformers)
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-        model_name = "gpt2"  # Replace with your desired local model
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name)
-        self.pipeline = pipeline("text-generation", model=self.model, tokenizer=self.tokenizer)
-    def chat(self, messages, functions=None, function_call="auto"):
-        # For local LLM, use the last message as the prompt.
-        prompt = messages[-1]["content"]
-        output = self.pipeline(prompt, max_length=150, do_sample=True)[0]["generated_text"]
-        # Mimic a response structure similar to OpenAI's response.
-        class DummyResponse:
-            def __init__(self, content):
-                self.choices = [type("Choice", (), {"message": {"content": content, "function_call": None}})]
-        return DummyResponse(output)
+    Args:
+        name: The name for the operator catalog.
+        index_image: The index image URL.
+        display_name: Optional display name.
+        publisher: Optional publisher name.
+        cleanup_timeout: Optional cleanup timeout (e.g., "1m0s").
+        namespace: Optional Kubernetes namespace.
+        timeout: Optional command timeout.
 
-# -------------------------------
-# Operator Functions
-# -------------------------------
-def operator_catalog_add(name: str, index_image: str, display_name: str = None,
-                         publisher: str = None, cleanup_timeout: str = None,
-                         namespace: str = None, timeout: str = None) -> str:
+    Returns:
+        The output of the command as a string.
+    """
     cmd = ["kubectl", "operator", "catalog", "add", name, index_image]
     if display_name:
         cmd.extend(["-d", display_name])
@@ -58,8 +47,21 @@ def operator_catalog_add(name: str, index_image: str, display_name: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_catalog_list(all_namespaces: bool = False, namespace: str = None,
+@tool
+def operator_catalog_list(all_namespaces: bool = False,
+                          namespace: str = None,
                           timeout: str = None) -> str:
+    """
+    Lists operator catalogs using 'kubectl operator catalog list'.
+
+    Args:
+        all_namespaces: If True, list across all namespaces.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The command output as a string.
+    """
     cmd = ["kubectl", "operator", "catalog", "list"]
     if all_namespaces:
         cmd.append("-A")
@@ -69,8 +71,21 @@ def operator_catalog_list(all_namespaces: bool = False, namespace: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_catalog_remove(catalog_name: str, namespace: str = None,
+@tool
+def operator_catalog_remove(catalog_name: str,
+                            namespace: str = None,
                             timeout: str = None) -> str:
+    """
+    Removes an operator catalog using 'kubectl operator catalog remove'.
+
+    Args:
+        catalog_name: The name of the catalog to remove.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The command output as a string.
+    """
     cmd = ["kubectl", "operator", "catalog", "remove", catalog_name]
     if namespace:
         cmd.extend(["-n", namespace])
@@ -78,8 +93,21 @@ def operator_catalog_remove(catalog_name: str, namespace: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_completion_bash(no_descriptions: bool = False, namespace: str = None,
+@tool
+def operator_completion_bash(no_descriptions: bool = False,
+                             namespace: str = None,
                              timeout: str = None) -> str:
+    """
+    Generates a bash autocompletion script via 'kubectl operator completion bash'.
+
+    Args:
+        no_descriptions: If True, disables completion descriptions.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The autocompletion script as a string.
+    """
     cmd = ["kubectl", "operator", "completion", "bash"]
     if no_descriptions:
         cmd.append("--no-descriptions")
@@ -89,8 +117,21 @@ def operator_completion_bash(no_descriptions: bool = False, namespace: str = Non
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_completion_fish(no_descriptions: bool = False, namespace: str = None,
+@tool
+def operator_completion_fish(no_descriptions: bool = False,
+                             namespace: str = None,
                              timeout: str = None) -> str:
+    """
+    Generates a fish autocompletion script via 'kubectl operator completion fish'.
+
+    Args:
+        no_descriptions: If True, disables completion descriptions.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The autocompletion script as a string.
+    """
     cmd = ["kubectl", "operator", "completion", "fish"]
     if no_descriptions:
         cmd.append("--no-descriptions")
@@ -100,8 +141,21 @@ def operator_completion_fish(no_descriptions: bool = False, namespace: str = Non
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_completion_powershell(no_descriptions: bool = False, namespace: str = None,
-                                    timeout: str = None) -> str:
+@tool
+def operator_completion_powershell(no_descriptions: bool = False,
+                                   namespace: str = None,
+                                   timeout: str = None) -> str:
+    """
+    Generates a PowerShell autocompletion script via 'kubectl operator completion powershell'.
+
+    Args:
+        no_descriptions: If True, disables completion descriptions.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The autocompletion script as a string.
+    """
     cmd = ["kubectl", "operator", "completion", "powershell"]
     if no_descriptions:
         cmd.append("--no-descriptions")
@@ -111,8 +165,21 @@ def operator_completion_powershell(no_descriptions: bool = False, namespace: str
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_completion_zsh(no_descriptions: bool = False, namespace: str = None,
-                             timeout: str = None) -> str:
+@tool
+def operator_completion_zsh(no_descriptions: bool = False,
+                            namespace: str = None,
+                            timeout: str = None) -> str:
+    """
+    Generates a zsh autocompletion script via 'kubectl operator completion zsh'.
+
+    Args:
+        no_descriptions: If True, disables completion descriptions.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The autocompletion script as a string.
+    """
     cmd = ["kubectl", "operator", "completion", "zsh"]
     if no_descriptions:
         cmd.append("--no-descriptions")
@@ -122,9 +189,27 @@ def operator_completion_zsh(no_descriptions: bool = False, namespace: str = None
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_describe(operator: str, catalog: str = None, channel: str = None,
-                      with_long_description: bool = False, namespace: str = None,
+@tool
+def operator_describe(operator: str,
+                      catalog: str = None,
+                      channel: str = None,
+                      with_long_description: bool = False,
+                      namespace: str = None,
                       timeout: str = None) -> str:
+    """
+    Describes an operator via 'kubectl operator describe'.
+
+    Args:
+        operator: The operator to describe.
+        catalog: Optional catalog name.
+        channel: Optional subscription channel.
+        with_long_description: If True, includes a long description.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The operator description as a string.
+    """
     cmd = ["kubectl", "operator", "describe", operator]
     if catalog:
         cmd.extend(["-c", catalog])
@@ -138,10 +223,33 @@ def operator_describe(operator: str, catalog: str = None, channel: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_install(operator: str, approval: str = None, channel: str = None,
-                     cleanup_timeout: str = None, create_operator_group: bool = False,
-                     version: str = None, watch: list = None, namespace: str = None,
+@tool
+def operator_install(operator: str,
+                     approval: str = None,
+                     channel: str = None,
+                     cleanup_timeout: str = None,
+                     create_operator_group: bool = False,
+                     version: str = None,
+                     watch: list = None,
+                     namespace: str = None,
                      timeout: str = None) -> str:
+    """
+    Installs an operator via 'kubectl operator install'.
+
+    Args:
+        operator: The operator to install.
+        approval: Optional approval type ("Manual" or "Automatic").
+        channel: Optional subscription channel.
+        cleanup_timeout: Optional cleanup timeout.
+        create_operator_group: If True, creates an operator group if needed.
+        version: Optional operator version.
+        watch: Optional list of namespaces to watch.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The installation command output as a string.
+    """
     cmd = ["kubectl", "operator", "install", operator]
     if approval:
         cmd.extend(["-a", approval])
@@ -162,8 +270,21 @@ def operator_install(operator: str, approval: str = None, channel: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_list_available(catalog: str = None, namespace: str = None,
+@tool
+def operator_list_available(catalog: str = None,
+                            namespace: str = None,
                             timeout: str = None) -> str:
+    """
+    Lists available operators via 'kubectl operator list-available'.
+
+    Args:
+        catalog: Optional catalog to query.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The list of available operators as a string.
+    """
     cmd = ["kubectl", "operator", "list-available"]
     if catalog:
         cmd.extend(["-c", catalog])
@@ -173,8 +294,23 @@ def operator_list_available(catalog: str = None, namespace: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_list_operands(operator: str, output: str = None, namespace: str = None,
+@tool
+def operator_list_operands(operator: str,
+                           output: str = None,
+                           namespace: str = None,
                            timeout: str = None) -> str:
+    """
+    Lists operands for an operator via 'kubectl operator list-operands'.
+
+    Args:
+        operator: The operator whose operands to list.
+        output: Optional output format (e.g., "json" or "yaml").
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The list of operands as a string.
+    """
     cmd = ["kubectl", "operator", "list-operands", operator]
     if output:
         cmd.extend(["-o", output])
@@ -184,8 +320,21 @@ def operator_list_operands(operator: str, output: str = None, namespace: str = N
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_olmv1_install(operator: str, namespace: str = None,
+@tool
+def operator_olmv1_install(operator: str,
+                           namespace: str = None,
                            timeout: str = None) -> str:
+    """
+    Installs an operator using OLMv1 via 'kubectl operator olmv1 install'.
+
+    Args:
+        operator: The operator to install.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The command output as a string.
+    """
     cmd = ["kubectl", "operator", "olmv1", "install", operator]
     if namespace:
         cmd.extend(["-n", namespace])
@@ -193,8 +342,21 @@ def operator_olmv1_install(operator: str, namespace: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_olmv1_uninstall(operator: str, namespace: str = None,
+@tool
+def operator_olmv1_uninstall(operator: str,
+                             namespace: str = None,
                              timeout: str = None) -> str:
+    """
+    Uninstalls an operator using OLMv1 via 'kubectl operator olmv1 uninstall'.
+
+    Args:
+        operator: The operator to uninstall.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The command output as a string.
+    """
     cmd = ["kubectl", "operator", "olmv1", "uninstall", operator]
     if namespace:
         cmd.extend(["-n", namespace])
@@ -202,10 +364,29 @@ def operator_olmv1_uninstall(operator: str, namespace: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_uninstall(operator: str, operand_strategy: str = None,
+@tool
+def operator_uninstall(operator: str,
+                       operand_strategy: str = None,
                        delete_operator_groups: bool = False,
-                       delete_operator: bool = False, delete_all: bool = False,
-                       namespace: str = None, timeout: str = None) -> str:
+                       delete_operator: bool = False,
+                       delete_all: bool = False,
+                       namespace: str = None,
+                       timeout: str = None) -> str:
+    """
+    Uninstalls an operator via 'kubectl operator uninstall'.
+
+    Args:
+        operator: The operator to uninstall.
+        operand_strategy: Optional strategy ("abort", "ignore", or "delete").
+        delete_operator_groups: If True, delete associated operator groups.
+        delete_operator: If True, delete the operator object.
+        delete_all: If True, delete all related resources.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The command output as a string.
+    """
     cmd = ["kubectl", "operator", "uninstall", operator]
     if operand_strategy:
         cmd.extend(["--operand-strategy", operand_strategy])
@@ -221,8 +402,23 @@ def operator_uninstall(operator: str, operand_strategy: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_upgrade(operator: str, channel: str = None, namespace: str = None,
+@tool
+def operator_upgrade(operator: str,
+                     channel: str = None,
+                     namespace: str = None,
                      timeout: str = None) -> str:
+    """
+    Upgrades an operator via 'kubectl operator upgrade'.
+
+    Args:
+        operator: The operator to upgrade.
+        channel: Optional upgrade channel.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The command output as a string.
+    """
     cmd = ["kubectl", "operator", "upgrade", operator]
     if channel:
         cmd.extend(["-c", channel])
@@ -232,7 +428,19 @@ def operator_upgrade(operator: str, channel: str = None, namespace: str = None,
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_version(namespace: str = None, timeout: str = None) -> str:
+@tool
+def operator_version(namespace: str = None,
+                     timeout: str = None) -> str:
+    """
+    Displays operator version information via 'kubectl operator version'.
+
+    Args:
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The version information as a string.
+    """
     cmd = ["kubectl", "operator", "version"]
     if namespace:
         cmd.extend(["-n", namespace])
@@ -240,7 +448,19 @@ def operator_version(namespace: str = None, timeout: str = None) -> str:
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_list(namespace: str = None, timeout: str = None) -> str:
+@tool
+def operator_list(namespace: str = None,
+                  timeout: str = None) -> str:
+    """
+    Lists installed operators via 'kubectl operator list'.
+
+    Args:
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The list of operators as a string.
+    """
     cmd = ["kubectl", "operator", "list"]
     if namespace:
         cmd.extend(["-n", namespace])
@@ -248,8 +468,23 @@ def operator_list(namespace: str = None, timeout: str = None) -> str:
         cmd.extend(["--timeout", timeout])
     return _run_subprocess(cmd)
 
-def operator_catalog_list_filtered(filter_term: str, all_namespaces: bool = False,
-                                   namespace: str = None, timeout: str = None) -> str:
+@tool
+def operator_catalog_list_filtered(filter_term: str,
+                                   all_namespaces: bool = False,
+                                   namespace: str = None,
+                                   timeout: str = None) -> str:
+    """
+    Lists catalogs filtered by a term via 'kubectl operator catalog list | grep'.
+
+    Args:
+        filter_term: The term to filter catalogs.
+        all_namespaces: If True, search all namespaces.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The filtered list as a string.
+    """
     cmd = ["kubectl", "operator", "catalog", "list"]
     if all_namespaces:
         cmd.append("-A")
@@ -260,8 +495,23 @@ def operator_catalog_list_filtered(filter_term: str, all_namespaces: bool = Fals
     cmd_str = " ".join(cmd) + f" | grep {filter_term}"
     return _run_shell_command(cmd_str)
 
-def operator_list_available_filtered(filter_term: str, catalog: str = None,
-                                     namespace: str = None, timeout: str = None) -> str:
+@tool
+def operator_list_available_filtered(filter_term: str,
+                                     catalog: str = None,
+                                     namespace: str = None,
+                                     timeout: str = None) -> str:
+    """
+    Lists available operators filtered by a term via 'kubectl operator list-available | grep'.
+
+    Args:
+        filter_term: The term to filter operators.
+        catalog: Optional catalog to query.
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The filtered list as a string.
+    """
     cmd = ["kubectl", "operator", "list-available"]
     if catalog:
         cmd.extend(["-c", catalog])
@@ -272,8 +522,25 @@ def operator_list_available_filtered(filter_term: str, catalog: str = None,
     cmd_str = " ".join(cmd) + f" | grep {filter_term}"
     return _run_shell_command(cmd_str)
 
-def operator_list_operands_filtered(operator: str, filter_term: str, output: str = None,
-                                    namespace: str = None, timeout: str = None) -> str:
+@tool
+def operator_list_operands_filtered(operator: str,
+                                    filter_term: str,
+                                    output: str = None,
+                                    namespace: str = None,
+                                    timeout: str = None) -> str:
+    """
+    Lists operands for an operator filtered by a term via 'kubectl operator list-operands | grep'.
+
+    Args:
+        operator: The operator name.
+        filter_term: The term to filter operands.
+        output: Optional output format (e.g., "json" or "yaml").
+        namespace: Optional namespace.
+        timeout: Optional command timeout.
+
+    Returns:
+        The filtered list as a string.
+    """
     cmd = ["kubectl", "operator", "list-operands", operator]
     if output:
         cmd.extend(["-o", output])
@@ -284,10 +551,19 @@ def operator_list_operands_filtered(operator: str, filter_term: str, output: str
     cmd_str = " ".join(cmd) + f" | grep {filter_term}"
     return _run_shell_command(cmd_str)
 
-# -------------------------------
-# Helper Functions for Command Execution
-# -------------------------------
+###############################################################################
+# Helpers for Command Execution
+###############################################################################
 def _run_shell_command(cmd_str: str) -> str:
+    """
+    Executes a shell command string (supports pipes) and returns its output.
+
+    Args:
+        cmd_str: The full command string.
+
+    Returns:
+        The command output as a string.
+    """
     print(f"[ACT] Executing command: `{cmd_str}`")
     try:
         result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, check=True)
@@ -296,6 +572,15 @@ def _run_shell_command(cmd_str: str) -> str:
         return f"Error executing {cmd_str}:\n{e.stderr}"
 
 def _run_subprocess(cmd) -> str:
+    """
+    Executes a command (without pipes) and returns its combined stdout and stderr.
+
+    Args:
+        cmd: A list of command parts.
+
+    Returns:
+        The combined output as a string.
+    """
     command_str = " ".join(cmd)
     print(f"[ACT] Executing command: `{command_str}`")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -310,63 +595,63 @@ def _run_subprocess(cmd) -> str:
         return result.stdout + "\n" + debug_info
     return result.stdout
 
-# -------------------------------
-# smolagents Agent Setup
-# -------------------------------
-def create_agent(llm):
-    # Create a dictionary mapping tool names to their corresponding functions.
-    tools = {
-        "operator_catalog_add": operator_catalog_add,
-        "operator_catalog_list": operator_catalog_list,
-        "operator_catalog_remove": operator_catalog_remove,
-        "operator_completion_bash": operator_completion_bash,
-        "operator_completion_fish": operator_completion_fish,
-        "operator_completion_powershell": operator_completion_powershell,
-        "operator_completion_zsh": operator_completion_zsh,
-        "operator_describe": operator_describe,
-        "operator_install": operator_install,
-        "operator_list_available": operator_list_available,
-        "operator_list_operands": operator_list_operands,
-        "operator_olmv1_install": operator_olmv1_install,
-        "operator_olmv1_uninstall": operator_olmv1_uninstall,
-        "operator_uninstall": operator_uninstall,
-        "operator_upgrade": operator_upgrade,
-        "operator_version": operator_version,
-        "operator_list": operator_list,
-        "operator_catalog_list_filtered": operator_catalog_list_filtered,
-        "operator_list_available_filtered": operator_list_available_filtered,
-        "operator_list_operands_filtered": operator_list_operands_filtered,
-    }
-    agent = smolagents.Agent(
-        llm=llm,
-        tools=tools,
-        system_prompt=(
-            "You are a Kubernetes Operator assistant. Use the available tools to answer user queries. "
-            "Decide on the best function to call and provide concise summaries of your actions and their outcomes."
-        )
-    )
-    return agent
+###############################################################################
+# CodeAgent Setup and Main Loop
+###############################################################################
+def create_agent(model):
+    """
+    Creates a CodeAgent with the provided model and operator tools.
 
-# -------------------------------
-# MAIN AGENT LOOP
-# -------------------------------
+    Args:
+        model: An instance of a callable model (e.g., HfApiModel or LiteLLMModel).
+
+    Returns:
+        A CodeAgent instance.
+    """
+    tools = [
+        operator_catalog_add,
+        operator_catalog_list,
+        operator_catalog_remove,
+        operator_completion_bash,
+        operator_completion_fish,
+        operator_completion_powershell,
+        operator_completion_zsh,
+        operator_describe,
+        operator_install,
+        operator_list_available,
+        operator_list_operands,
+        operator_olmv1_install,
+        operator_olmv1_uninstall,
+        operator_uninstall,
+        operator_upgrade,
+        operator_version,
+        operator_list,
+        operator_catalog_list_filtered,
+        operator_list_available_filtered,
+        operator_list_operands_filtered,
+    ]
+    return CodeAgent(tools=tools, model=model)
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Kubernetes Operator Assistant Agent (using smolagents)"
+        description="Kubernetes Operator Assistant Agent (using smolagents CodeAgent)"
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--gpt", action="store_true", help="Use OpenAI GPT-based completions API")
-    group.add_argument("--local-llm", action="store_true", help="Use local LLM for completions")
+    group.add_argument("--gpt", action="store_true", help="Use OpenAI (LiteLLMModel) for completions")
+    group.add_argument("--local-llm", action="store_true", help="Use Hugging Face (HfApiModel) for completions")
     args = parser.parse_args()
 
     if args.gpt:
-        llm = GPTLLM()
-        print("Using OpenAI GPT completions API.")
+        if not os.getenv("OPENAI_API_KEY"):
+            raise ValueError("Missing OPENAI_API_KEY environment variable")
+        model = LiteLLMModel(model_id="gpt-4o-mini-2024-07-18")
+        print("Using OpenAI completions (LiteLLMModel).")
     elif args.local_llm:
-        llm = LocalLLM()
-        print("Using local LLM for completions.")
+        # Replace with your desired Hugging Face model ID, e.g., "google/bard" or another.
+        model = HfApiModel(model_id="google/bard")
+        print("Using Hugging Face completions (HfApiModel).")
 
-    agent = create_agent(llm)
+    agent = create_agent(model)
     print("Starting smolagents conversation. Type 'quit' to exit.")
 
     while True:
@@ -380,8 +665,8 @@ def main():
             print("Bye!")
             break
 
-        response = agent.act(user_input)
-        print("\nAssistant: " + response)
+        result = agent.run(user_input)
+        print("\nAssistant: " + result)
 
 if __name__ == "__main__":
     main()
