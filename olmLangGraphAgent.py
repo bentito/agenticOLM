@@ -7,8 +7,8 @@ from langgraph.graph import StateGraph, START, END, add_messages
 from typing_extensions import TypedDict
 import operator
 
-# Set up detailed logging for debugging.
-logging.basicConfig(level=logging.ERROR)
+# Set up logging for moderate debug output.
+logging.basicConfig(level=logging.INFO)  # Adjust level as needed.
 
 # Define the state for our repository discovery workflow.
 class RepoDiscoveryState(TypedDict):
@@ -17,6 +17,7 @@ class RepoDiscoveryState(TypedDict):
     selected_file: str
     file_content: str
     extracted_commands: str
+    iteration: int  # New counter to track recursion depth
 
 # Helper function to parse owner and repo from a GitHub URL.
 def get_repo_owner_and_name(repo_url: str) -> (str, str):
@@ -33,14 +34,13 @@ def discover_repo(state: RepoDiscoveryState) -> dict:
     owner, repo = get_repo_owner_and_name(repo_url)
     branch = "main"  # Assumes 'main' is the default branch; adjust if necessary.
     api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
-    logging.debug("Fetching repository file list from: %s", api_url)
+    logging.info("Fetching repository file list from: %s", api_url)
     response = requests.get(api_url)
     if response.status_code != 200:
         logging.error("Error fetching repo files: %s", response.status_code)
         candidate_files = []
     else:
         tree = response.json().get("tree", [])
-        # Filter for blobs (files) and keep files with extensions likely to contain CLI definitions.
         candidate_files = [
             item["path"]
             for item in tree
@@ -60,7 +60,6 @@ Given the following list of files from a repository:
 Which file is most likely to contain the definitions for CLI commands (entry points, flags, subcommands)?
 Respond with only the file name.
 """
-    logging.debug("Select File Prompt:\n%s", prompt)
     response = llm.invoke([HumanMessage(content=prompt)])
     selected = response.content.strip()
     print("Selected file:", selected)
@@ -73,7 +72,6 @@ def fetch_file_content(state: RepoDiscoveryState) -> dict:
     branch = "main"  # Adjust if needed.
     base_raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/"
     file_url = base_raw_url + selected
-    logging.debug("Fetching file from URL: %s", file_url)
     response = requests.get(file_url)
     if response.status_code == 200:
         content = response.text
@@ -97,38 +95,68 @@ Return only the JSON output without additional commentary.
 File Content:
 {content}
 """
-    logging.debug("Extract Commands Prompt:\n%s", prompt)
     response = llm.invoke([HumanMessage(content=prompt)])
     extracted = response.content.strip()
     print("Extracted commands JSON:", extracted)
     return {"extracted_commands": extracted}
 
-# --- Build the state graph integrating nodes 1 to 4 ---
+# --- Node 5: Check extraction and decide whether to revisit another file ---
+def check_extraction(state: RepoDiscoveryState) -> dict:
+    iteration = state.get("iteration", 0)
+    extracted = state["extracted_commands"]
+    print(f"Iteration {iteration}: Extracted commands length: {len(extracted)}")
+    # If extraction is too minimal and we haven't hit a max iteration limit, try a new file.
+    if len(extracted) < 100 and iteration < 5:
+        print("Extraction too minimal; need to revisit another file.")
+        current = state["selected_file"]
+        candidates = state["file_list"]
+        remaining = [f for f in candidates if f != current]
+        if remaining:
+            new_selection = remaining[0]
+            print("New selected file:", new_selection)
+            # Increment iteration count and update state.
+            return {"selected_file": new_selection, "extracted_commands": "", "iteration": iteration + 1}
+        else:
+            print("No more candidate files available; stopping recursion.")
+    # If extraction is sufficient or max iterations reached, do nothing.
+    return {}
+
+# --- Build the state graph integrating nodes 1 to 5 ---
 def build_graph() -> StateGraph:
     graph_builder = StateGraph(RepoDiscoveryState)
     graph_builder.add_node("discover", discover_repo)
     graph_builder.add_node("select", select_file)
     graph_builder.add_node("fetch", fetch_file_content)
     graph_builder.add_node("extract", extract_commands)
-    # Define the workflow: discover -> select -> fetch -> extract.
+    graph_builder.add_node("check", check_extraction)
+    # Define the workflow:
+    # discover -> select -> fetch -> extract -> check
     graph_builder.set_entry_point("discover")
     graph_builder.add_edge("discover", "select")
     graph_builder.add_edge("select", "fetch")
     graph_builder.add_edge("fetch", "extract")
-    graph_builder.set_finish_point("extract")
+    graph_builder.add_edge("extract", "check")
+    # If check updates the state (i.e. extraction is too minimal), loop back to fetch.
+    graph_builder.add_edge("check", "fetch")
+    # Set finish point at check.
+    graph_builder.set_finish_point("check")
     return graph_builder.compile()
 
 # --- Main execution ---
 if __name__ == "__main__":
-    # Initialize the state with the repository URL and empty values for other fields.
+    # Initialize the state with the repository URL and an iteration counter.
     initial_state: RepoDiscoveryState = {
         "repo_url": "https://github.com/operator-framework/kubectl-operator",
         "file_list": [],
         "selected_file": "",
         "file_content": "",
-        "extracted_commands": ""
+        "extracted_commands": "",
+        "iteration": 0
     }
     graph = build_graph()
-    result = graph.invoke(initial_state)
-    print("=== Final Result ===")
-    print(result)
+    try:
+        result = graph.invoke(initial_state)
+        print("=== Final Result ===")
+        print(result)
+    except Exception as e:
+        print("Graph execution error:", str(e))
