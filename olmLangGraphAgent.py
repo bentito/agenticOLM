@@ -7,8 +7,9 @@ from langgraph.graph import StateGraph, START, END, add_messages
 from typing_extensions import TypedDict
 import operator
 
-# Set up logging for moderate debug output.
-logging.basicConfig(level=logging.INFO)  # Adjust level as needed.
+# Set up logging.
+logging.basicConfig(level=logging.INFO)
+
 
 # Define the state for our repository discovery workflow.
 class RepoDiscoveryState(TypedDict):
@@ -17,9 +18,10 @@ class RepoDiscoveryState(TypedDict):
     selected_file: str
     file_content: str
     extracted_commands: str
-    iteration: int  # New counter to track recursion depth
+    iteration: int  # Track recursion depth
 
-# Helper function to parse owner and repo from a GitHub URL.
+
+# Helper: Parse owner and repo from a GitHub URL.
 def get_repo_owner_and_name(repo_url: str) -> (str, str):
     parsed = urlparse(repo_url)
     parts = parsed.path.strip("/").split("/")
@@ -28,11 +30,12 @@ def get_repo_owner_and_name(repo_url: str) -> (str, str):
     else:
         raise Exception("Invalid repo URL format")
 
+
 # --- Node 1: Discover candidate files using the GitHub API ---
 def discover_repo(state: RepoDiscoveryState) -> dict:
     repo_url = state["repo_url"]
     owner, repo = get_repo_owner_and_name(repo_url)
-    branch = "main"  # Assumes 'main' is the default branch; adjust if necessary.
+    branch = "main"  # Adjust if necessary.
     api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     logging.info("Fetching repository file list from: %s", api_url)
     response = requests.get(api_url)
@@ -49,9 +52,12 @@ def discover_repo(state: RepoDiscoveryState) -> dict:
     print("Discovered candidate files:", candidate_files)
     return {"file_list": candidate_files}
 
-# --- Node 2: Select a file to analyze using GPT-4o ---
+
+# Initialize the LLM model.
 llm = ChatOpenAI(model="gpt-4o", temperature=0, verbose=False)
 
+
+# --- Node 2: Select a file to analyze using GPT-4o ---
 def select_file(state: RepoDiscoveryState) -> dict:
     file_list = state["file_list"]
     prompt = f"""You are an expert in CLI tool analysis.
@@ -64,6 +70,7 @@ Respond with only the file name.
     selected = response.content.strip()
     print("Selected file:", selected)
     return {"selected_file": selected}
+
 
 # --- Node 3: Fetch the content of the selected file ---
 def fetch_file_content(state: RepoDiscoveryState) -> dict:
@@ -80,6 +87,7 @@ def fetch_file_content(state: RepoDiscoveryState) -> dict:
         content = f"Error: failed to fetch {selected}"
         print(content)
     return {"file_content": content}
+
 
 # --- Node 4: Extract CLI commands from the file content ---
 def extract_commands(state: RepoDiscoveryState) -> dict:
@@ -100,12 +108,13 @@ File Content:
     print("Extracted commands JSON:", extracted)
     return {"extracted_commands": extracted}
 
-# --- Node 5: Check extraction and decide whether to revisit another file ---
+
+# --- Node 5: Check extraction and decide whether to continue ---
 def check_extraction(state: RepoDiscoveryState) -> dict:
     iteration = state.get("iteration", 0)
     extracted = state["extracted_commands"]
     print(f"Iteration {iteration}: Extracted commands length: {len(extracted)}")
-    # If extraction is too minimal and we haven't hit a max iteration limit, try a new file.
+    # If extraction appears too minimal (less than 100 chars), continue; else, finish.
     if len(extracted) < 100 and iteration < 5:
         print("Extraction too minimal; need to revisit another file.")
         current = state["selected_file"]
@@ -114,14 +123,20 @@ def check_extraction(state: RepoDiscoveryState) -> dict:
         if remaining:
             new_selection = remaining[0]
             print("New selected file:", new_selection)
-            # Increment iteration count and update state.
-            return {"selected_file": new_selection, "extracted_commands": "", "iteration": iteration + 1}
+            return {
+                "selected_file": new_selection,
+                "extracted_commands": "",
+                "iteration": iteration + 1
+            }
         else:
             print("No more candidate files available; stopping recursion.")
-    # If extraction is sufficient or max iterations reached, do nothing.
-    return {}
+            return {"extracted_commands": extracted}
+    else:
+        # If extraction is sufficient, signal that we're done.
+        return {"extracted_commands": extracted, "done": True}
 
-# --- Build the state graph integrating nodes 1 to 5 ---
+
+# --- Build the state graph integrating nodes 1 to 5 with conditional edge ---
 def build_graph() -> StateGraph:
     graph_builder = StateGraph(RepoDiscoveryState)
     graph_builder.add_node("discover", discover_repo)
@@ -129,6 +144,7 @@ def build_graph() -> StateGraph:
     graph_builder.add_node("fetch", fetch_file_content)
     graph_builder.add_node("extract", extract_commands)
     graph_builder.add_node("check", check_extraction)
+
     # Define the workflow:
     # discover -> select -> fetch -> extract -> check
     graph_builder.set_entry_point("discover")
@@ -136,15 +152,18 @@ def build_graph() -> StateGraph:
     graph_builder.add_edge("select", "fetch")
     graph_builder.add_edge("fetch", "extract")
     graph_builder.add_edge("extract", "check")
-    # If check updates the state (i.e. extraction is too minimal), loop back to fetch.
-    graph_builder.add_edge("check", "fetch")
-    # Set finish point at check.
-    graph_builder.set_finish_point("check")
+
+    # Conditional edge: from check, if state contains "done" == True, go to END; else loop back to fetch.
+    def check_condition(state: RepoDiscoveryState) -> str:
+        return "finish" if state.get("done", False) else "continue"
+
+    graph_builder.add_conditional_edges("check", check_condition, {"finish": END, "continue": "fetch"})
     return graph_builder.compile()
+
 
 # --- Main execution ---
 if __name__ == "__main__":
-    # Initialize the state with the repository URL and an iteration counter.
+    # Initialize the state.
     initial_state: RepoDiscoveryState = {
         "repo_url": "https://github.com/operator-framework/kubectl-operator",
         "file_list": [],
