@@ -1,4 +1,5 @@
 import requests
+import json
 import logging
 from urllib.parse import urlparse
 from langchain_openai import ChatOpenAI
@@ -6,9 +7,11 @@ from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END, add_messages
 from typing_extensions import TypedDict
 import operator
+import random
 
 # Set up logging.
 logging.basicConfig(level=logging.INFO)
+
 
 # Define the state for our repository discovery workflow.
 class RepoDiscoveryState(TypedDict):
@@ -19,6 +22,7 @@ class RepoDiscoveryState(TypedDict):
     extracted_commands: str
     iteration: int  # Track recursion depth
 
+
 # Helper: Parse owner and repo from a GitHub URL.
 def get_repo_owner_and_name(repo_url: str) -> (str, str):
     parsed = urlparse(repo_url)
@@ -27,6 +31,7 @@ def get_repo_owner_and_name(repo_url: str) -> (str, str):
         return parts[0], parts[1]
     else:
         raise Exception("Invalid repo URL format")
+
 
 # --- Node 1: Discover candidate files using the GitHub API ---
 def discover_repo(state: RepoDiscoveryState) -> dict:
@@ -49,26 +54,51 @@ def discover_repo(state: RepoDiscoveryState) -> dict:
     print("Discovered candidate files:", candidate_files)
     return {"file_list": candidate_files}
 
+
 # Initialize the LLM model.
 llm = ChatOpenAI(model="gpt-4o", temperature=0, verbose=False)
+
 
 # --- Node 2: Select a file to analyze using GPT-4o with improved prompt ---
 def select_file(state: RepoDiscoveryState) -> dict:
     file_list = state["file_list"]
+    # Remove any bias for now—use the full list.
     prompt = f"""You are an expert in analyzing code repositories for CLI tools.
 Given the following list of file paths from a repository:
 {file_list}
 Determine which file is most likely to contain the actual code for defining the CLI commands (including entry points, flags, subcommands, and options).
-Keep in mind:
-  - Source code files (e.g. those with .go extension, especially under directories like "cmd/" or "internal/cmd") are more promising.
-  - Documentation files (e.g. README.md) may only contain descriptions and not actual command definitions.
-Respond with only the file name.
+Additionally, output a JSON object with two keys: "selected_file" and "confidence", where "selected_file" is the file name and "confidence" is a number between 0 and 1 indicating your confidence.
+Respond with only the JSON object.
 """
     print("Select File Prompt:\n", prompt)
     response = llm.invoke([HumanMessage(content=prompt)])
-    selected = response.content.strip()
-    print("Selected file:", selected)
+    response_text = response.content.strip()
+
+    # Remove markdown delimiters if present
+    if response_text.startswith("```"):
+        lines = response_text.splitlines()
+        # Remove the first line if it starts with triple backticks (and an optional language marker)
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        # Remove the last line if it starts with triple backticks
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        clean_text = "\n".join(lines).strip()
+    else:
+        clean_text = response_text
+
+    try:
+        selection = json.loads(clean_text)
+        selected = selection.get("selected_file", "")
+        confidence = selection.get("confidence", 0)
+    except Exception as e:
+        print("Error parsing selection response:", e)
+        # Fallback: choose randomly from file_list.
+        selected = random.choice(file_list)
+        confidence = 0.5
+    print("Selected file:", selected, "with confidence:", confidence)
     return {"selected_file": selected}
+
 
 # --- Node 3: Fetch the content of the selected file ---
 def fetch_file_content(state: RepoDiscoveryState) -> dict:
@@ -87,17 +117,18 @@ def fetch_file_content(state: RepoDiscoveryState) -> dict:
         print(content)
     return {"file_content": content}
 
+
 # --- Node 4: Extract CLI commands from the file content with improved prompt ---
 def extract_commands(state: RepoDiscoveryState) -> dict:
     content = state["file_content"]
     prompt = f"""You are a tool extraction assistant with expertise in programming languages.
 Analyze the following file content from a CLI tool's codebase. If the file content is sufficiently long (at least 200 characters), extract all commands, subcommands, flags, and options.
-If the file content is very short, respond with an empty JSON object with "commands": [].
+If the file content is very short, respond with an empty JSON object: {{"commands": []}}.
 Return a valid JSON object with a single key "commands", whose value is a list of objects.
 Each object should include:
   - "name": the command or subcommand name,
   - "description": a brief description of what the command does.
-Return only the JSON output without additional commentary.
+Return only the JSON output without any additional commentary.
 
 File Content:
 {content}
@@ -108,16 +139,25 @@ File Content:
     print("Extracted commands JSON:", extracted)
     return {"extracted_commands": extracted}
 
-# --- Node 5: Check extraction and decide whether to continue (improved prompt approach) ---
+
+# --- Node 5: Check extraction and decide whether to continue ---
 def check_extraction(state: RepoDiscoveryState) -> dict:
     iteration = state.get("iteration", 0)
     extracted = state["extracted_commands"]
     print(f"Iteration {iteration}: Extracted commands length: {len(extracted)}")
-    # If extraction appears too minimal (less than 100 characters) and we haven't hit a max iteration limit, then try another file.
-    if len(extracted) < 100 and iteration < 5:
-        print("Extraction too minimal; need to revisit another file.")
+    try:
+        data = json.loads(extracted)
+        commands = data.get("commands", [])
+    except Exception as e:
+        print("Error parsing extracted JSON:", e)
+        commands = []
+
+    # Require at least 2 commands to consider extraction sufficient.
+    if len(commands) < 2 and iteration < 5:
+        print("Extraction insufficient; need to revisit another file.")
         current = state["selected_file"]
         candidates = state["file_list"]
+        # Remove current candidate from list
         remaining = [f for f in candidates if f != current]
         if remaining:
             new_selection = remaining[0]
@@ -131,10 +171,11 @@ def check_extraction(state: RepoDiscoveryState) -> dict:
             print("No more candidate files available; stopping recursion.")
             return {"extracted_commands": extracted, "done": True}
     else:
-        # Extraction appears sufficient; signal finish.
+        # Extraction appears sufficient.
         return {"extracted_commands": extracted, "done": True}
 
-# --- Build the state graph integrating nodes 1 to 5 with a conditional edge ---
+
+# --- Build the state graph integrating nodes 1 to 5 with conditional edge ---
 def build_graph() -> StateGraph:
     graph_builder = StateGraph(RepoDiscoveryState)
     graph_builder.add_node("discover", discover_repo)
@@ -143,8 +184,7 @@ def build_graph() -> StateGraph:
     graph_builder.add_node("extract", extract_commands)
     graph_builder.add_node("check", check_extraction)
 
-    # Define the workflow:
-    # discover -> select -> fetch -> extract -> check
+    # Define the workflow: discover -> select -> fetch -> extract -> check
     graph_builder.set_entry_point("discover")
     graph_builder.add_edge("discover", "select")
     graph_builder.add_edge("select", "fetch")
@@ -157,6 +197,7 @@ def build_graph() -> StateGraph:
 
     graph_builder.add_conditional_edges("check", check_condition, {"finish": END, "continue": "fetch"})
     return graph_builder.compile()
+
 
 # --- Main execution ---
 if __name__ == "__main__":
