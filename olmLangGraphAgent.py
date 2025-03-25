@@ -33,6 +33,11 @@ def get_repo_owner_and_name(repo_url: str) -> (str, str):
         raise Exception("Invalid repo URL format")
 
 
+# Helper: Determine if any path segment starts with a dot.
+def is_hidden(path: str) -> bool:
+    return any(segment.startswith('.') for segment in path.split('/'))
+
+
 # --- Node 1: Discover candidate files using the GitHub API ---
 def discover_repo(state: RepoDiscoveryState) -> dict:
     repo_url = state["repo_url"]
@@ -49,7 +54,7 @@ def discover_repo(state: RepoDiscoveryState) -> dict:
         candidate_files = [
             item["path"]
             for item in tree
-            if item["type"] == "blob" and item["path"].endswith((".go", ".md", ".txt"))
+            if item["type"] == "blob" and not is_hidden(item["path"])
         ]
     print("Discovered candidate files:", candidate_files)
     return {"file_list": candidate_files}
@@ -62,38 +67,32 @@ llm = ChatOpenAI(model="gpt-4o", temperature=0, verbose=False)
 # --- Node 2: Select a file to analyze using GPT-4o with improved prompt ---
 def select_file(state: RepoDiscoveryState) -> dict:
     file_list = state["file_list"]
-    # Remove any bias for now—use the full list.
     prompt = f"""You are an expert in analyzing code repositories for CLI tools.
 Given the following list of file paths from a repository:
 {file_list}
 Determine which file is most likely to contain the actual code for defining the CLI commands (including entry points, flags, subcommands, and options).
-Additionally, output a JSON object with two keys: "selected_file" and "confidence", where "selected_file" is the file name and "confidence" is a number between 0 and 1 indicating your confidence.
-Respond with only the JSON object.
+Respond with a JSON object with two keys: "selected_file" (the file name) and "confidence" (a number between 0 and 1 indicating your confidence).
+Return only the JSON output.
 """
     print("Select File Prompt:\n", prompt)
     response = llm.invoke([HumanMessage(content=prompt)])
     response_text = response.content.strip()
-
-    # Remove markdown delimiters if present
+    # Remove markdown delimiters if present.
     if response_text.startswith("```"):
         lines = response_text.splitlines()
-        # Remove the first line if it starts with triple backticks (and an optional language marker)
         if lines[0].startswith("```"):
             lines = lines[1:]
-        # Remove the last line if it starts with triple backticks
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
         clean_text = "\n".join(lines).strip()
     else:
         clean_text = response_text
-
     try:
         selection = json.loads(clean_text)
         selected = selection.get("selected_file", "")
         confidence = selection.get("confidence", 0)
     except Exception as e:
         print("Error parsing selection response:", e)
-        # Fallback: choose randomly from file_list.
         selected = random.choice(file_list)
         confidence = 0.5
     print("Selected file:", selected, "with confidence:", confidence)
@@ -133,7 +132,10 @@ Return only the JSON output without any additional commentary.
 File Content:
 {content}
 """
-    print("Extract Commands Prompt:\n", prompt)
+    if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+        print("Extract Commands Prompt:\n", prompt)
+    else:
+        print("Sending Extract Commands Prompt")
     response = llm.invoke([HumanMessage(content=prompt)])
     extracted = response.content.strip()
     print("Extracted commands JSON:", extracted)
@@ -157,7 +159,7 @@ def check_extraction(state: RepoDiscoveryState) -> dict:
         print("Extraction insufficient; need to revisit another file.")
         current = state["selected_file"]
         candidates = state["file_list"]
-        # Remove current candidate from list
+        # Remove the current candidate.
         remaining = [f for f in candidates if f != current]
         if remaining:
             new_selection = remaining[0]
