@@ -87,7 +87,7 @@ def ensure_command_in_path(cmd: dict, path: List[str]) -> dict:
 # State Definition
 ########################################
 
-class ToolDiscoveryState(TypedDict):
+class ToolDiscoveryState(TypedDict, total=False):
     """
     The shared state for discovering a CLI tool's commands.
     """
@@ -96,6 +96,8 @@ class ToolDiscoveryState(TypedDict):
     processed_subcommands: List[List[str]]
     root_command: dict                # aggregator for all commands (a single root)
     done: bool
+    help_output: str                  # added to store help output
+    return_code: int                  # added to store return code
 
 ########################################
 # Graph Nodes
@@ -187,6 +189,7 @@ Your job:
    - If you see relevant flags, add them to "flags".
 
 Help Output:
+{help_text}
 Return only a valid JSON object in the form:
 {{
   "commands": [
@@ -358,7 +361,7 @@ def build_graph() -> StateGraph:
 ########################################
 
 if __name__ == "__main__":
-    # Suppose we want to discover multiple tools. For now, just one:
+    # tools we want to discover how to use, from their help systems:
     tools = ["bin/kubectl-operator"]
 
     graph = build_graph()
@@ -382,7 +385,8 @@ if __name__ == "__main__":
         }
 
         try:
-            result = graph.invoke(initial_state)
+            config = {"recursion_limit": 100, "configurable": {"thread_id": "my-thread-id"}}
+            result = graph.invoke(initial_state, config)
 
             final_output = {
                 "tool_path": result["tool_path"],
@@ -395,6 +399,3 @@ if __name__ == "__main__":
 
         except Exception as e:
             logging.error(f"Graph execution error for {tool_path}: {e}")
-
-    # If you want a combined JSON for all tools:
-    # print(json.dumps(results, indent=2))
