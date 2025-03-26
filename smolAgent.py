@@ -653,6 +653,28 @@ def main():
         )
         print("Using Locally Served LLM via OpenAIServerModel.")
 
+        model = OpenAIServerModel(
+            model_id="MHKetbi/Unsloth-Phi-4-mini-instruct",
+            api_base="http://localhost:8080/v1",
+        )
+        print("Using Locally Served LLM via OpenAIServerModel.")
+
+        model = OpenAIServerModel(
+            model_id="phi4-mini:latest",
+            api_base="http://0.0.0.0:8080/v1",
+        )
+        print("Using Locally Served LLM via OpenAIServerModel.")
+
+        # hf_token = os.getenv("HF_TOKEN")
+        # if not hf_token:
+        #     raise ValueError("Missing HF_TOKEN environment variable")
+        # model = OpenAIServerModel(
+        #     model_id="SmolLM2-1.7B-Instruct",
+        #     api_base="https://pt4gh0vnzxemy2ux.us-east-1.aws.endpoints.huggingface.cloud/v1",
+        #     api_key=os.environ["HF_TOKEN"]
+        # )
+        # print("Using Hugging Face completions (OpenAIServerModel)")
+
     agent = create_agent(model)
     print("Starting smolagents conversation. Type 'quit' to exit.")
 
