@@ -385,7 +385,7 @@ if __name__ == "__main__":
         }
 
         try:
-            config = {"recursion_limit": 100, "configurable": {"thread_id": "my-thread-id"}}
+            config = {"recursion_limit": 150, "configurable": {"thread_id": "my-thread-id"}}
             result = graph.invoke(initial_state, config)
 
             final_output = {
