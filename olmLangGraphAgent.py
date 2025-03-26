@@ -102,6 +102,7 @@ class ToolDiscoveryState(TypedDict, total=False):
     done: bool
     help_output: str  # added to store help output
     return_code: int  # added to store return code
+    cached: bool  # flag indicating if cache was loaded
 
 
 ########################################
@@ -115,11 +116,13 @@ def init_state_node(state: ToolDiscoveryState) -> dict:
     which has already been set to name=basename(tool_path).
     """
     logging.info("Initializing tool discovery state.")
+    state["cached"] = False
     return {
         "subcommand_queue": [[]],
         "processed_subcommands": [],
         "root_command": state["root_command"],
-        "done": False
+        "done": False,
+        "cached": state["cached"]
     }
 
 
@@ -129,19 +132,20 @@ def cache_check_node(state: ToolDiscoveryState) -> dict:
     cache_dir = "tool_info"
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
+        logging.info(f"Cache directory {cache_dir} created.")
     cache_filename = new_state["tool_path"].replace(os.sep, "_") + "_help.json"
     cache_filepath = os.path.join(cache_dir, cache_filename)
+    logging.info(f"Computed cache_filepath: {cache_filepath}")
     if os.path.exists(cache_filepath):
         logging.info(f"Cache found in cache_check_node for {new_state['tool_path']} at {cache_filepath}")
         with open(cache_filepath, "r") as f:
             cached_data = json.load(f)
-        # Update root_command with cached tool description.
         if "commands" in cached_data and cached_data["commands"]:
             new_state["root_command"] = cached_data["commands"][0]
-        # Set done so that warmup steps are skipped.
         new_state["done"] = True
+        new_state["cached"] = True
     else:
-        logging.info("No cache found in cache_check_node, proceeding with discovery.")
+        logging.info(f"No cache found at {cache_filepath}, proceeding with discovery.")
     return new_state
 
 
@@ -194,7 +198,6 @@ def parse_tool_help_node(state: ToolDiscoveryState) -> dict:
     help_text = new_state.get("help_output", "")
     root_cmd = new_state["root_command"]
 
-    # Enhanced prompt to coax the LLM to find subcommands, usage lines, etc.
     prompt = f"""You are an expert at extracting CLI structure from help text. 
 We have a command path: {' '.join(sub_path)}. 
 
@@ -232,7 +235,6 @@ Return only a valid JSON object in the form:
 }}
 No extra commentary.
 """
-
     logging.info("Parsing tool help output with the LLM.")
     response = llm.invoke([HumanMessage(content=prompt)])
     content = clean_markdown(response.content)
@@ -250,7 +252,6 @@ No extra commentary.
 
     current_cmd_data = commands_found[0]
 
-    # If sub_path is empty => the root command
     if len(sub_path) == 0:
         desc = current_cmd_data.get("description", "")
         if desc:
@@ -309,11 +310,11 @@ No extra commentary.
     newly_discovered = collect_subcommands(current_cmd_data, sub_path)
     processed = new_state["processed_subcommands"]
     for p in newly_discovered:
-        if p not in queue and p not in processed and p != sub_path:
+        if p not in new_state["subcommand_queue"] and p not in processed and p != sub_path:
             if len(p) >= 2 and p[-1] == p[-2]:
                 logging.warning(f"Skipping potential self-cycle path: {p}")
                 continue
-            queue.append(p)
+            new_state["subcommand_queue"].append(p)
 
     logging.info("Aggregated commands after parsing:")
     logging.info(json.dumps(new_state["root_command"], indent=2))
@@ -383,6 +384,9 @@ def cache_write_node(state: ToolDiscoveryState) -> dict:
     logging.info(f"Writing cache to {cache_filepath}")
     with open(cache_filepath, "w") as f:
         json.dump(final_output, f, indent=2)
+    if not new_state.get("cached", False):
+        logging.info("=== Final Discovered CLI Structure ===")
+        logging.info(json.dumps(final_output, indent=2))
     new_state["final_output"] = final_output
     return new_state
 
@@ -404,8 +408,16 @@ def build_graph() -> StateGraph:
     g.add_node("cache_write", cache_write_node)
 
     g.set_entry_point("init")
+
+    # Use conditional edge right after cache_check.
+    def cache_condition(state: ToolDiscoveryState) -> str:
+        return "finish" if state.get("done") else "continue"
+
     g.add_edge("init", "cache_check")
-    g.add_edge("cache_check", "call_tool_help")
+    g.add_conditional_edges("cache_check", cache_condition, {
+        "finish": "trial_tool_call",
+        "continue": "call_tool_help"
+    })
     g.add_edge("call_tool_help", "parse_help")
     g.add_edge("parse_help", "mark_processed")
     g.add_edge("mark_processed", "check_done")
@@ -435,8 +447,7 @@ if __name__ == "__main__":
     results = []
 
     for tool_path in tools:
-        tool_basename = os.path.basename(tool_path)  # e.g. "kubectl-operator"
-        # Prepare initial state for this tool
+        tool_basename = os.path.basename(tool_path)
         initial_state: ToolDiscoveryState = {
             "tool_path": tool_path,
             "subcommand_queue": [],
@@ -448,18 +459,9 @@ if __name__ == "__main__":
             },
             "done": False
         }
-
         try:
             config = {"recursion_limit": 150, "configurable": {"thread_id": "my-thread-id"}}
             result = graph.invoke(initial_state, config)
-
-            final_output = result.get("final_output", {
-                "tool_path": result["tool_path"],
-                "commands": [result["root_command"]],
-                "tool_call": result.get("tool_call")
-            })
-            print("=== Final Discovered CLI Structure for", tool_path, "===")
-            print(json.dumps(final_output, indent=2))
-            results.append(final_output)
+            results.append(result.get("final_output", {}))
         except Exception as e:
             logging.error(f"Graph execution error for {tool_path}: {e}")
