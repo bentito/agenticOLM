@@ -2,20 +2,20 @@ import json
 import logging
 import copy
 import subprocess
+import os
+from typing import List, Dict, Any
 from typing_extensions import TypedDict
+
+# Requires langchain_openai, langchain_core, langgraph installed:
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
-from typing import List, Dict, Any
 
 ########################################
 # Setup
 ########################################
 
-# Configure logging if desired
 logging.basicConfig(level=logging.INFO)
-
-# Initialize the LLM model for all nodes
 llm = ChatOpenAI(model="gpt-4o", temperature=0, verbose=False)
 
 ########################################
@@ -29,7 +29,6 @@ def clean_markdown(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
-        # Strip the first line if it's a fence, and the last if it’s a fence
         if lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].startswith("```"):
@@ -37,59 +36,52 @@ def clean_markdown(text: str) -> str:
         text = "\n".join(lines).strip()
     return text
 
-def merge_commands(existing: dict, new: dict) -> dict:
+def merge_flags(existing_flags: List[dict], new_flags: List[dict]) -> List[dict]:
     """
-    Merge two command objects that have the same "name".
-    Recursively merges subcommands and flags, while reconciling descriptions.
+    Merge flags by 'name'. If a flag with the same name exists,
+    unify or combine descriptions.
     """
-    merged = {"name": existing["name"]}
-
-    # Merge descriptions: if they differ, combine them or pick the non-empty
-    desc1 = existing.get("description", "")
-    desc2 = new.get("description", "")
-    if desc1 == desc2:
-        merged["description"] = desc1
-    else:
-        if not desc1:
-            merged["description"] = desc2
-        elif not desc2:
-            merged["description"] = desc1
+    merged = copy.deepcopy(existing_flags)
+    for nf in new_flags:
+        found_flag = None
+        for ef in merged:
+            if ef["name"] == nf["name"]:
+                found_flag = ef
+                break
+        if found_flag:
+            d1, d2 = found_flag.get("description",""), nf.get("description","")
+            if d1 != d2:
+                if not d1:
+                    found_flag["description"] = d2
+                elif not d2:
+                    found_flag["description"] = d1
+                else:
+                    if d2 not in d1:
+                        found_flag["description"] = list({d1, d2})
         else:
-            # Combine both distinct descriptions, preserving uniqueness
-            merged["description"] = list({desc1, desc2})
-
-    for key in ["subcommands", "flags"]:
-        items_existing = existing.get(key, [])
-        items_new = new.get(key, [])
-        merged_items = items_existing.copy()
-        for new_item in items_new:
-            found = False
-            for idx, exist_item in enumerate(merged_items):
-                if exist_item.get("name") == new_item.get("name"):
-                    merged_items[idx] = merge_commands(exist_item, new_item)
-                    found = True
-                    break
-            if not found:
-                merged_items.append(new_item)
-        if merged_items:
-            merged[key] = merged_items
-
+            merged.append(nf)
     return merged
 
-def update_aggregated_commands(agg: List[dict], new_commands: List[dict]) -> List[dict]:
+def ensure_command_in_path(cmd: dict, path: List[str]) -> dict:
     """
-    Merge newly discovered commands into the aggregator.
+    Traverse cmd["subcommands"] along 'path', creating placeholders if needed.
+    Return the command dict at that path.
     """
-    for new_cmd in new_commands:
-        found = False
-        for i, existing_cmd in enumerate(agg):
-            if existing_cmd.get("name") == new_cmd.get("name"):
-                agg[i] = merge_commands(existing_cmd, new_cmd)
-                found = True
+    current = cmd
+    for part in path:
+        if "subcommands" not in current:
+            current["subcommands"] = []
+        found = None
+        for sc in current["subcommands"]:
+            if sc["name"] == part:
+                found = sc
                 break
         if not found:
-            agg.append(new_cmd)
-    return agg
+            new_sub = {"name": part, "description": "", "subcommands": []}
+            current["subcommands"].append(new_sub)
+            found = new_sub
+        current = found
+    return current
 
 ########################################
 # State Definition
@@ -99,15 +91,10 @@ class ToolDiscoveryState(TypedDict):
     """
     The shared state for discovering a CLI tool's commands.
     """
-    # The root path of the CLI tool (like "bin/kubectl-operator")
-    tool_path: str
-    # A queue of subcommand paths left to process (each item is a list of strings)
-    subcommand_queue: List[List[str]]
-    # Already processed subcommand paths
+    tool_path: str                    # e.g. "bin/kubectl-operator"
+    subcommand_queue: List[List[str]] # queue of subcommand paths to process
     processed_subcommands: List[List[str]]
-    # The aggregator of discovered commands
-    aggregated_commands: List[dict]
-    # Flag to mark completion
+    root_command: dict                # aggregator for all commands (a single root)
     done: bool
 
 ########################################
@@ -116,21 +103,23 @@ class ToolDiscoveryState(TypedDict):
 
 def init_state_node(state: ToolDiscoveryState) -> dict:
     """
-    Initialize the subcommand queue with just the empty list (root command).
+    Initialize the queue with the empty sub_path (root).
+    Keep the existing root_command from the initial state,
+    which has already been set to name=basename(tool_path).
     """
     logging.info("Initializing tool discovery state.")
     return {
-        "subcommand_queue": [[]],  # Start with root (no subcommand)
+        "subcommand_queue": [[]],
         "processed_subcommands": [],
-        "aggregated_commands": [],
-        "done": False,
+        "root_command": state["root_command"],
+        "done": False
     }
 
 def call_tool_help_node(state: ToolDiscoveryState) -> dict:
     """
-    Take the first subcommand path from the queue,
-    call `tool_path <subcommand_path> help` via subprocess,
-    store the output in the state.
+    Pop the first subcommand path from the queue,
+    run `tool_path ...sub_path... help` via subprocess,
+    store the output.
     """
     new_state = copy.deepcopy(state)
     queue = new_state["subcommand_queue"]
@@ -140,7 +129,6 @@ def call_tool_help_node(state: ToolDiscoveryState) -> dict:
     sub_path = queue[0]
     logging.info(f"Processing subcommand path: {sub_path}")
 
-    # Build the command list, e.g. ["bin/kubectl-operator", "cluster", "install", "help"]
     cmd_list = [new_state["tool_path"]] + sub_path + ["help"]
     logging.info(f"Running command: {' '.join(cmd_list)}")
 
@@ -149,7 +137,7 @@ def call_tool_help_node(state: ToolDiscoveryState) -> dict:
             cmd_list,
             capture_output=True,
             text=True,
-            check=False  # Don't raise on non-zero exit
+            check=False
         )
         new_state["help_output"] = completed_proc.stdout + "\n" + completed_proc.stderr
         new_state["return_code"] = completed_proc.returncode
@@ -162,23 +150,55 @@ def call_tool_help_node(state: ToolDiscoveryState) -> dict:
 
 def parse_tool_help_node(state: ToolDiscoveryState) -> dict:
     """
-    Parse the help text via the LLM to extract commands, subcommands, flags.
-    Update aggregator and discover new subcommands to enqueue.
+    Pass the help text to the LLM with robust instructions
+    so it can extract subcommands from 'Available Commands:' or 'Usage:' sections.
+    Then integrate them into the aggregator and discover new subcommands to queue.
     """
     new_state = copy.deepcopy(state)
-    help_text = new_state.get("help_output", "")
-    sub_path = new_state["subcommand_queue"][0] if new_state["subcommand_queue"] else []
+    queue = new_state["subcommand_queue"]
+    if not queue:
+        return new_state
 
-    prompt = f"""You are an expert at parsing CLI help text. Below is the full help output of a CLI tool for the subcommand path "{' '.join(sub_path)}". 
-Extract a JSON structure with:
-- "name": The command name
-- "description": Brief description
-- Optional "subcommands": list of similar objects
-- Optional "flags": list of objects with "name" and "description"
-Return a valid JSON object with a top-level "commands" list.
+    sub_path = queue[0]
+    help_text = new_state.get("help_output", "")
+    root_cmd = new_state["root_command"]
+
+    # Enhanced prompt to coax the LLM to find subcommands, usage lines, etc.
+    prompt = f"""You are an expert at extracting CLI structure from help text. 
+We have a command path: {' '.join(sub_path)}. 
+
+Your job:
+1. Read the help text below carefully for "Usage:" or "Available Commands:" or "Commands:" lines 
+   (and any synonyms).
+2. Identify subcommands and flags. 
+3. Even if the text doesn't explicitly say 'subcommands', do your best to infer them 
+   from lines like 'kubectl-operator [command]' or 'install   Install something'.
+4. Return a JSON with a top-level "commands" array containing exactly one object:
+   {{
+     "name": "<the command name for this path>",
+     "description": "<short desc>",
+     "subcommands": [ ... ],
+     "flags": [ {{ "name": "...", "description": "..." }} ]
+   }}
+   - "subcommands" should be an array of objects in the same format. 
+   - If this path is empty, the name is the top-level command (we've set it in code).
+   - If the path is something like ["foo","bar"], the name is just "bar" (not "foo bar").
+   - If you see usage lines that might indicate more subcommands, add them. 
+   - If you see relevant flags, add them to "flags".
 
 Help Output:
-Return only the JSON, nothing else.
+Return only a valid JSON object in the form:
+{{
+  "commands": [
+    {{
+      "name": "...",
+      "description": "...",
+      "subcommands": [...],
+      "flags": [...]
+    }}
+  ]
+}}
+No extra commentary.
 """
 
     logging.info("Parsing tool help output with the LLM.")
@@ -192,40 +212,105 @@ Return only the JSON, nothing else.
         logging.warning(f"Failed to parse JSON from LLM: {e}")
         commands_found = []
 
-    # Merge into aggregator
-    agg = new_state["aggregated_commands"]
-    new_state["aggregated_commands"] = update_aggregated_commands(agg, commands_found)
+    if not commands_found:
+        # no data to merge
+        logging.info("No subcommands or flags discovered.")
+        return new_state
 
-    logging.info("Aggregated commands after parsing:")
-    logging.info(json.dumps(new_state["aggregated_commands"], indent=2))
+    current_cmd_data = commands_found[0]
 
-    # Gather subcommands found; queue them
-    def collect_subcommands(cmd_list: List[dict], current_path: List[str]) -> List[List[str]]:
+    # If sub_path is empty => the root command
+    if len(sub_path) == 0:
+        # Merge the description
+        desc = current_cmd_data.get("description","")
+        if desc:
+            root_cmd["description"] = desc
+
+        # Merge flags
+        new_flags = current_cmd_data.get("flags", [])
+        old_flags = root_cmd.get("flags", [])
+        root_cmd["flags"] = merge_flags(old_flags, new_flags)
+
+        # Merge subcommands
+        if "subcommands" in current_cmd_data:
+            root_cmd["subcommands"] = current_cmd_data["subcommands"]
+
+    else:
+        # sub_path is non-empty
+        parent_path = sub_path[:-1]
+        this_sub_name = sub_path[-1]
+
+        # Find or create the parent
+        parent_cmd = ensure_command_in_path(root_cmd, parent_path)
+
+        # Check if parent's subcommands has an entry for this_sub_name
+        sub_list = parent_cmd.get("subcommands", [])
+        existing_sub = None
+        for sc in sub_list:
+            if sc["name"] == this_sub_name:
+                existing_sub = sc
+                break
+        if not existing_sub:
+            existing_sub = {"name": this_sub_name, "description": "", "subcommands": []}
+            sub_list.append(existing_sub)
+
+        # Merge description
+        old_desc = existing_sub.get("description","")
+        new_desc = current_cmd_data.get("description","")
+        if new_desc and (new_desc != old_desc):
+            if not old_desc:
+                existing_sub["description"] = new_desc
+            elif new_desc not in old_desc:
+                existing_sub["description"] = old_desc + " / " + new_desc
+
+        # Merge flags
+        old_flags = existing_sub.get("flags", [])
+        found_flags = current_cmd_data.get("flags", [])
+        existing_sub["flags"] = merge_flags(old_flags, found_flags)
+
+        # Merge subcommands
+        for child_sub in current_cmd_data.get("subcommands", []):
+            child_name = child_sub["name"]
+            found_child = None
+            for c in existing_sub["subcommands"]:
+                if c["name"] == child_name:
+                    found_child = c
+                    break
+            if not found_child:
+                existing_sub["subcommands"].append(child_sub)
+            else:
+                found_child.update(child_sub)
+
+    # Now discover new subcommands to queue
+    def collect_subcommands(cmd_obj: dict, base_path: List[str]) -> List[List[str]]:
         new_paths = []
-        for c in cmd_list:
-            name = c.get("name")
-            subcmds = c.get("subcommands", [])
-            if name:
-                new_paths.append(current_path + [name])
-            if subcmds:
-                deeper_paths = collect_subcommands(subcmds, current_path + [name])
-                new_paths.extend(deeper_paths)
+        for sc in cmd_obj.get("subcommands", []):
+            name = sc.get("name")
+            if not name:
+                continue
+            candidate_path = base_path + [name]
+            new_paths.append(candidate_path)
+            new_paths += collect_subcommands(sc, candidate_path)
         return new_paths
 
-    newly_discovered_paths = collect_subcommands(commands_found, sub_path)
+    newly_discovered = collect_subcommands(current_cmd_data, sub_path)
 
-    queue = new_state["subcommand_queue"]
     processed = new_state["processed_subcommands"]
-    for p in newly_discovered_paths:
-        if p not in queue and p not in processed:
+    for p in newly_discovered:
+        if p not in queue and p not in processed and p != sub_path:
+            # skip pathological self-cycle
+            if len(p) >= 2 and p[-1] == p[-2]:
+                logging.warning(f"Skipping potential self-cycle path: {p}")
+                continue
             queue.append(p)
+
+    # Show partial aggregator
+    logging.info("Aggregated commands after parsing:")
+    logging.info(json.dumps(new_state["root_command"], indent=2))
 
     return new_state
 
 def mark_subcommand_processed_node(state: ToolDiscoveryState) -> dict:
-    """
-    Remove the front subcommand path from the queue and put it into processed_subcommands.
-    """
     new_state = copy.deepcopy(state)
     if new_state["subcommand_queue"]:
         processed_sub = new_state["subcommand_queue"].pop(0)
@@ -233,9 +318,6 @@ def mark_subcommand_processed_node(state: ToolDiscoveryState) -> dict:
     return new_state
 
 def check_done_node(state: ToolDiscoveryState) -> dict:
-    """
-    If the queue is empty, set done=True, else False.
-    """
     if not state["subcommand_queue"]:
         state["done"] = True
     else:
@@ -254,13 +336,6 @@ def build_graph() -> StateGraph:
     g.add_node("parse_help", parse_tool_help_node)
     g.add_node("mark_processed", mark_subcommand_processed_node)
     g.add_node("check_done", check_done_node)
-
-    # Workflow:
-    # 1) init -> call_tool_help
-    # 2) call_tool_help -> parse_help
-    # 3) parse_help -> mark_processed
-    # 4) mark_processed -> check_done
-    # 5) check_done -> either done or back to call_tool_help
 
     g.set_entry_point("init")
     g.add_edge("init", "call_tool_help")
@@ -283,25 +358,43 @@ def build_graph() -> StateGraph:
 ########################################
 
 if __name__ == "__main__":
-    # Start with a single tool: "bin/kubectl-operator"
-    initial_state: ToolDiscoveryState = {
-        "tool_path": "bin/kubectl-operator",
-        "subcommand_queue": [],
-        "processed_subcommands": [],
-        "aggregated_commands": [],
-        "done": False,
-    }
+    # Suppose we want to discover multiple tools. For now, just one:
+    tools = ["bin/kubectl-operator"]
 
     graph = build_graph()
+    results = []
 
-    try:
-        result = graph.invoke(initial_state)
-        # Wrap the aggregator in the final JSON with tool path at the top
-        final_output = {
-            "tool": result["tool_path"],
-            "commands": result.get("aggregated_commands", [])
+    for tool_path in tools:
+        tool_basename = os.path.basename(tool_path)  # e.g. "kubectl-operator"
+
+        # Prepare initial state for this tool
+        initial_state: ToolDiscoveryState = {
+            "tool_path": tool_path,
+            "subcommand_queue": [],
+            "processed_subcommands": [],
+            # Single root command dict
+            "root_command": {
+                "name": tool_basename,
+                "description": "",
+                "subcommands": []
+            },
+            "done": False
         }
-        print("=== Final Discovered CLI Structure ===")
-        print(json.dumps(final_output, indent=2))
-    except Exception as e:
-        logging.error(f"Graph execution error: {e}")
+
+        try:
+            result = graph.invoke(initial_state)
+
+            final_output = {
+                "tool_path": result["tool_path"],
+                "commands": [result["root_command"]]
+            }
+            print("=== Final Discovered CLI Structure for", tool_path, "===")
+            print(json.dumps(final_output, indent=2))
+
+            results.append(final_output)
+
+        except Exception as e:
+            logging.error(f"Graph execution error for {tool_path}: {e}")
+
+    # If you want a combined JSON for all tools:
+    # print(json.dumps(results, indent=2))
