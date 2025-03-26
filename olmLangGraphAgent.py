@@ -123,6 +123,28 @@ def init_state_node(state: ToolDiscoveryState) -> dict:
     }
 
 
+# New node: Check for cached output and load it if available.
+def cache_check_node(state: ToolDiscoveryState) -> dict:
+    new_state = copy.deepcopy(state)
+    cache_dir = "tool_info"
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    cache_filename = new_state["tool_path"].replace(os.sep, "_") + "_help.json"
+    cache_filepath = os.path.join(cache_dir, cache_filename)
+    if os.path.exists(cache_filepath):
+        logging.info(f"Cache found in cache_check_node for {new_state['tool_path']} at {cache_filepath}")
+        with open(cache_filepath, "r") as f:
+            cached_data = json.load(f)
+        # Update root_command with cached tool description.
+        if "commands" in cached_data and cached_data["commands"]:
+            new_state["root_command"] = cached_data["commands"][0]
+        # Set done so that warmup steps are skipped.
+        new_state["done"] = True
+    else:
+        logging.info("No cache found in cache_check_node, proceeding with discovery.")
+    return new_state
+
+
 def call_tool_help_node(state: ToolDiscoveryState) -> dict:
     """
     Pop the first subcommand path from the queue,
@@ -223,7 +245,6 @@ No extra commentary.
         commands_found = []
 
     if not commands_found:
-        # no data to merge
         logging.info("No subcommands or flags discovered.")
         return new_state
 
@@ -231,29 +252,18 @@ No extra commentary.
 
     # If sub_path is empty => the root command
     if len(sub_path) == 0:
-        # Merge the description
         desc = current_cmd_data.get("description", "")
         if desc:
             root_cmd["description"] = desc
-
-        # Merge flags
         new_flags = current_cmd_data.get("flags", [])
         old_flags = root_cmd.get("flags", [])
         root_cmd["flags"] = merge_flags(old_flags, new_flags)
-
-        # Merge subcommands
         if "subcommands" in current_cmd_data:
             root_cmd["subcommands"] = current_cmd_data["subcommands"]
-
     else:
-        # sub_path is non-empty
         parent_path = sub_path[:-1]
         this_sub_name = sub_path[-1]
-
-        # Find or create the parent
         parent_cmd = ensure_command_in_path(root_cmd, parent_path)
-
-        # Check if parent's subcommands has an entry for this_sub_name
         sub_list = parent_cmd.get("subcommands", [])
         existing_sub = None
         for sc in sub_list:
@@ -263,8 +273,6 @@ No extra commentary.
         if not existing_sub:
             existing_sub = {"name": this_sub_name, "description": "", "subcommands": []}
             sub_list.append(existing_sub)
-
-        # Merge description
         old_desc = existing_sub.get("description", "")
         new_desc = current_cmd_data.get("description", "")
         if new_desc and (new_desc != old_desc):
@@ -272,13 +280,9 @@ No extra commentary.
                 existing_sub["description"] = new_desc
             elif new_desc not in old_desc:
                 existing_sub["description"] = old_desc + " / " + new_desc
-
-        # Merge flags
         old_flags = existing_sub.get("flags", [])
         found_flags = current_cmd_data.get("flags", [])
         existing_sub["flags"] = merge_flags(old_flags, found_flags)
-
-        # Merge subcommands
         for child_sub in current_cmd_data.get("subcommands", []):
             child_name = child_sub["name"]
             found_child = None
@@ -291,7 +295,6 @@ No extra commentary.
             else:
                 found_child.update(child_sub)
 
-    # Now discover new subcommands to queue
     def collect_subcommands(cmd_obj: dict, base_path: List[str]) -> List[List[str]]:
         new_paths = []
         for sc in cmd_obj.get("subcommands", []):
@@ -304,20 +307,16 @@ No extra commentary.
         return new_paths
 
     newly_discovered = collect_subcommands(current_cmd_data, sub_path)
-
     processed = new_state["processed_subcommands"]
     for p in newly_discovered:
         if p not in queue and p not in processed and p != sub_path:
-            # skip pathological self-cycle
             if len(p) >= 2 and p[-1] == p[-2]:
                 logging.warning(f"Skipping potential self-cycle path: {p}")
                 continue
             queue.append(p)
 
-    # Show partial aggregator
     logging.info("Aggregated commands after parsing:")
     logging.info(json.dumps(new_state["root_command"], indent=2))
-
     return new_state
 
 
@@ -368,6 +367,26 @@ Return only a valid JSON object representing the tool call with keys "tool", "fu
     return new_state
 
 
+# New node: write the final result to cache.
+def cache_write_node(state: ToolDiscoveryState) -> dict:
+    new_state = copy.deepcopy(state)
+    cache_dir = "tool_info"
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    cache_filename = new_state["tool_path"].replace(os.sep, "_") + "_help.json"
+    cache_filepath = os.path.join(cache_dir, cache_filename)
+    final_output = {
+        "tool_path": new_state["tool_path"],
+        "commands": [new_state["root_command"]],
+        "tool_call": new_state.get("tool_call")
+    }
+    logging.info(f"Writing cache to {cache_filepath}")
+    with open(cache_filepath, "w") as f:
+        json.dump(final_output, f, indent=2)
+    new_state["final_output"] = final_output
+    return new_state
+
+
 ########################################
 # Build the Graph
 ########################################
@@ -376,14 +395,17 @@ def build_graph() -> StateGraph:
     g = StateGraph(ToolDiscoveryState)
 
     g.add_node("init", init_state_node)
+    g.add_node("cache_check", cache_check_node)
     g.add_node("call_tool_help", call_tool_help_node)
     g.add_node("parse_help", parse_tool_help_node)
     g.add_node("mark_processed", mark_subcommand_processed_node)
     g.add_node("check_done", check_done_node)
     g.add_node("trial_tool_call", trial_tool_call_node)
+    g.add_node("cache_write", cache_write_node)
 
     g.set_entry_point("init")
-    g.add_edge("init", "call_tool_help")
+    g.add_edge("init", "cache_check")
+    g.add_edge("cache_check", "call_tool_help")
     g.add_edge("call_tool_help", "parse_help")
     g.add_edge("parse_help", "mark_processed")
     g.add_edge("mark_processed", "check_done")
@@ -395,7 +417,8 @@ def build_graph() -> StateGraph:
         "finish": "trial_tool_call",
         "continue": "call_tool_help"
     })
-    g.add_edge("trial_tool_call", END)
+    g.add_edge("trial_tool_call", "cache_write")
+    g.add_edge("cache_write", END)
 
     return g.compile()
 
@@ -408,56 +431,35 @@ if __name__ == "__main__":
     # tools we want to discover how to use, from their help systems:
     tools = ["bin/kubectl-operator"]
 
-    # Caching: create directory if needed.
-    cache_dir = "tool_info"
-    if not os.path.exists(cache_dir):
-        os.makedirs(cache_dir)
-
     graph = build_graph()
     results = []
 
     for tool_path in tools:
         tool_basename = os.path.basename(tool_path)  # e.g. "kubectl-operator"
-        # Cache filename: replace os.sep with underscore.
-        cache_filename = tool_path.replace(os.sep, "_") + "_help.json"
-        cache_filepath = os.path.join(cache_dir, cache_filename)
+        # Prepare initial state for this tool
+        initial_state: ToolDiscoveryState = {
+            "tool_path": tool_path,
+            "subcommand_queue": [],
+            "processed_subcommands": [],
+            "root_command": {
+                "name": tool_basename,
+                "description": "",
+                "subcommands": []
+            },
+            "done": False
+        }
 
-        if os.path.exists(cache_filepath):
-            logging.info(f"Found cached tool info for {tool_path} at {cache_filepath}. Loading...")
-            with open(cache_filepath, "r") as f:
-                final_output = json.load(f)
+        try:
+            config = {"recursion_limit": 150, "configurable": {"thread_id": "my-thread-id"}}
+            result = graph.invoke(initial_state, config)
+
+            final_output = result.get("final_output", {
+                "tool_path": result["tool_path"],
+                "commands": [result["root_command"]],
+                "tool_call": result.get("tool_call")
+            })
             print("=== Final Discovered CLI Structure for", tool_path, "===")
             print(json.dumps(final_output, indent=2))
             results.append(final_output)
-        else:
-            # Prepare initial state for this tool
-            initial_state: ToolDiscoveryState = {
-                "tool_path": tool_path,
-                "subcommand_queue": [],
-                "processed_subcommands": [],
-                # Single root command dict
-                "root_command": {
-                    "name": tool_basename,
-                    "description": "",
-                    "subcommands": []
-                },
-                "done": False
-            }
-
-            try:
-                config = {"recursion_limit": 150, "configurable": {"thread_id": "my-thread-id"}}
-                result = graph.invoke(initial_state, config)
-
-                final_output = {
-                    "tool_path": result["tool_path"],
-                    "commands": [result["root_command"]],
-                    "tool_call": result.get("tool_call")
-                }
-                print("=== Final Discovered CLI Structure for", tool_path, "===")
-                print(json.dumps(final_output, indent=2))
-
-                results.append(final_output)
-                with open(cache_filepath, "w") as f:
-                    json.dump(final_output, f, indent=2)
-            except Exception as e:
-                logging.error(f"Graph execution error for {tool_path}: {e}")
+        except Exception as e:
+            logging.error(f"Graph execution error for {tool_path}: {e}")
