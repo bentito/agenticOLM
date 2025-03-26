@@ -1,48 +1,35 @@
-import requests
 import json
 import logging
-from urllib.parse import urlparse
+import copy
+import subprocess
+from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
-from langgraph.graph import StateGraph, START, END, add_messages
-from typing_extensions import TypedDict
-import operator
-import random
+from langgraph.graph import StateGraph, START, END
+from typing import List, Dict, Any
 
-# Set up logging.
+########################################
+# Setup
+########################################
+
+# Configure logging if desired
 logging.basicConfig(level=logging.INFO)
 
+# Initialize the LLM model for all nodes
+llm = ChatOpenAI(model="gpt-4o", temperature=0, verbose=False)
 
-# Define the state for our repository discovery workflow.
-class RepoDiscoveryState(TypedDict):
-    repo_url: str
-    file_list: list[str]
-    selected_file: str
-    file_content: str
-    extracted_commands: str
-    iteration: int  # Track recursion depth
+########################################
+# Helpers
+########################################
 
-
-# Helper: Parse owner and repo from a GitHub URL.
-def get_repo_owner_and_name(repo_url: str) -> (str, str):
-    parsed = urlparse(repo_url)
-    parts = parsed.path.strip("/").split("/")
-    if len(parts) >= 2:
-        return parts[0], parts[1]
-    else:
-        raise Exception("Invalid repo URL format")
-
-
-# Helper: Determine if any path segment starts with a dot.
-def is_hidden(path: str) -> bool:
-    return any(segment.startswith('.') for segment in path.split('/'))
-
-
-# Helper: Clean markdown formatting from LLM output.
 def clean_markdown(text: str) -> str:
+    """
+    Remove triple-backtick fences and extra whitespace from LLM outputs.
+    """
     text = text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
+        # Strip the first line if it's a fence, and the last if it’s a fence
         if lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].startswith("```"):
@@ -50,173 +37,271 @@ def clean_markdown(text: str) -> str:
         text = "\n".join(lines).strip()
     return text
 
+def merge_commands(existing: dict, new: dict) -> dict:
+    """
+    Merge two command objects that have the same "name".
+    Recursively merges subcommands and flags, while reconciling descriptions.
+    """
+    merged = {"name": existing["name"]}
 
-# --- Node 1: Discover candidate files using the GitHub API ---
-def discover_repo(state: RepoDiscoveryState) -> dict:
-    repo_url = state["repo_url"]
-    owner, repo = get_repo_owner_and_name(repo_url)
-    branch = "main"  # Adjust if necessary.
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
-    logging.info("Fetching repository file list from: %s", api_url)
-    response = requests.get(api_url)
-    if response.status_code != 200:
-        logging.error("Error fetching repo files: %s", response.status_code)
-        candidate_files = []
+    # Merge descriptions: if they differ, combine them or pick the non-empty
+    desc1 = existing.get("description", "")
+    desc2 = new.get("description", "")
+    if desc1 == desc2:
+        merged["description"] = desc1
     else:
-        tree = response.json().get("tree", [])
-        candidate_files = [
-            item["path"]
-            for item in tree
-            if item["type"] == "blob" and not is_hidden(item["path"])
-        ]
-    print("Discovered candidate files:", candidate_files)
-    return {"file_list": candidate_files}
-
-
-# Initialize the LLM model.
-llm = ChatOpenAI(model="gpt-4o", temperature=0, verbose=False)
-
-
-# --- Node 2: Select a file to analyze using GPT-4o with improved prompt ---
-def select_file(state: RepoDiscoveryState) -> dict:
-    file_list = state["file_list"]
-    prompt = f"""You are an expert in analyzing code repositories for CLI tools.
-Given the following list of file paths from a repository:
-{file_list}
-Determine which file is most likely to contain the actual code for defining user-facing CLI commands (i.e. commands that end users would use) rather than internal or developer-only commands.
-Respond with a JSON object with two keys: "selected_file" (the file name) and "confidence" (a number between 0 and 1 indicating your confidence).
-Return only the JSON output.
-"""
-    print("Select File Prompt:\n", prompt)
-    response = llm.invoke([HumanMessage(content=prompt)])
-    response_text = clean_markdown(response.content)
-    try:
-        selection = json.loads(response_text)
-        selected = selection.get("selected_file", "")
-        confidence = selection.get("confidence", 0)
-    except Exception as e:
-        print("Error parsing selection response:", e)
-        selected = random.choice(file_list)
-        confidence = 0.5
-    print("Selected file:", selected, "with confidence:", confidence)
-    return {"selected_file": selected}
-
-
-# --- Node 3: Fetch the content of the selected file ---
-def fetch_file_content(state: RepoDiscoveryState) -> dict:
-    selected = state["selected_file"]
-    owner, repo = get_repo_owner_and_name(state["repo_url"])
-    branch = "main"  # Adjust if needed.
-    base_raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/"
-    file_url = base_raw_url + selected
-    print("Fetching file content from:", file_url)
-    response = requests.get(file_url)
-    if response.status_code == 200:
-        content = response.text
-        print(f"Fetched content from {selected} (length {len(content)} characters)")
-    else:
-        content = f"Error: failed to fetch {selected}"
-        print(content)
-    return {"file_content": content}
-
-
-# --- Node 4: Extract CLI commands from the file content with improved prompt ---
-def extract_commands(state: RepoDiscoveryState) -> dict:
-    content = state["file_content"]
-    prompt = f"""You are a tool extraction assistant with expertise in programming languages.
-Analyze the following file content from a CLI tool's codebase. If the file content is sufficiently long (at least 200 characters), extract all user-facing commands, subcommands, flags, and options.
-Avoid internal or developer-only commands.
-If the file content is very short, respond with an empty JSON object: {{"commands": []}}.
-Return a valid JSON object with a single key "commands", whose value is a list of objects.
-Each object should include:
-  - "name": the command or subcommand name,
-  - "description": a brief description of what the command does.
-Return only the JSON output without any additional commentary.
-
-File Content:
-{content}
-"""
-    if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
-        print("Extract Commands Prompt:\n", prompt)
-    else:
-        print("Sending Extract Commands Prompt")
-    response = llm.invoke([HumanMessage(content=prompt)])
-    extracted = clean_markdown(response.content)
-    print("Extracted commands JSON:", extracted)
-    return {"extracted_commands": extracted}
-
-
-# --- Node 5: Check extraction and decide whether to continue ---
-def check_extraction(state: RepoDiscoveryState) -> dict:
-    iteration = state.get("iteration", 0)
-    extracted = state["extracted_commands"]
-    print(f"Iteration {iteration}: Extracted commands length: {len(extracted)}")
-    try:
-        data = json.loads(extracted)
-        commands = data.get("commands", [])
-    except Exception as e:
-        print("Error parsing extracted JSON:", e)
-        commands = []
-
-    # Require at least 2 commands to consider extraction sufficient.
-    if len(commands) < 2 and iteration < 5:
-        print("Extraction insufficient; need to revisit another file.")
-        current = state["selected_file"]
-        candidates = state["file_list"]
-        remaining = [f for f in candidates if f != current]
-        if remaining:
-            new_selection = remaining[0]
-            print("New selected file:", new_selection)
-            return {
-                "selected_file": new_selection,
-                "extracted_commands": "",
-                "iteration": iteration + 1
-            }
+        if not desc1:
+            merged["description"] = desc2
+        elif not desc2:
+            merged["description"] = desc1
         else:
-            print("No more candidate files available; stopping recursion.")
-            return {"extracted_commands": extracted, "done": True}
-    else:
-        return {"extracted_commands": extracted, "done": True}
+            # Combine both distinct descriptions, preserving uniqueness
+            merged["description"] = list({desc1, desc2})
 
+    for key in ["subcommands", "flags"]:
+        items_existing = existing.get(key, [])
+        items_new = new.get(key, [])
+        merged_items = items_existing.copy()
+        for new_item in items_new:
+            found = False
+            for idx, exist_item in enumerate(merged_items):
+                if exist_item.get("name") == new_item.get("name"):
+                    merged_items[idx] = merge_commands(exist_item, new_item)
+                    found = True
+                    break
+            if not found:
+                merged_items.append(new_item)
+        if merged_items:
+            merged[key] = merged_items
 
-# --- Build the state graph integrating nodes 1 to 5 with conditional edge ---
-def build_graph() -> StateGraph:
-    graph_builder = StateGraph(RepoDiscoveryState)
-    graph_builder.add_node("discover", discover_repo)
-    graph_builder.add_node("select", select_file)
-    graph_builder.add_node("fetch", fetch_file_content)
-    graph_builder.add_node("extract", extract_commands)
-    graph_builder.add_node("check", check_extraction)
+    return merged
 
-    # Define the workflow: discover -> select -> fetch -> extract -> check
-    graph_builder.set_entry_point("discover")
-    graph_builder.add_edge("discover", "select")
-    graph_builder.add_edge("select", "fetch")
-    graph_builder.add_edge("fetch", "extract")
-    graph_builder.add_edge("extract", "check")
+def update_aggregated_commands(agg: List[dict], new_commands: List[dict]) -> List[dict]:
+    """
+    Merge newly discovered commands into the aggregator.
+    """
+    for new_cmd in new_commands:
+        found = False
+        for i, existing_cmd in enumerate(agg):
+            if existing_cmd.get("name") == new_cmd.get("name"):
+                agg[i] = merge_commands(existing_cmd, new_cmd)
+                found = True
+                break
+        if not found:
+            agg.append(new_cmd)
+    return agg
 
-    # Conditional edge: if check returns "done": true, finish; else loop back to fetch.
-    def check_condition(state: RepoDiscoveryState) -> str:
-        return "finish" if state.get("done", False) else "continue"
+########################################
+# State Definition
+########################################
 
-    graph_builder.add_conditional_edges("check", check_condition, {"finish": END, "continue": "fetch"})
-    return graph_builder.compile()
+class ToolDiscoveryState(TypedDict):
+    """
+    The shared state for discovering a CLI tool's commands.
+    """
+    # The root path of the CLI tool (like "bin/kubectl-operator")
+    tool_path: str
+    # A queue of subcommand paths left to process (each item is a list of strings)
+    subcommand_queue: List[List[str]]
+    # Already processed subcommand paths
+    processed_subcommands: List[List[str]]
+    # The aggregator of discovered commands
+    aggregated_commands: List[dict]
+    # Flag to mark completion
+    done: bool
 
+########################################
+# Graph Nodes
+########################################
 
-# --- Main execution ---
-if __name__ == "__main__":
-    initial_state: RepoDiscoveryState = {
-        "repo_url": "https://github.com/operator-framework/kubectl-operator",
-        "file_list": [],
-        "selected_file": "",
-        "file_content": "",
-        "extracted_commands": "",
-        "iteration": 0
+def init_state_node(state: ToolDiscoveryState) -> dict:
+    """
+    Initialize the subcommand queue with just the empty list (root command).
+    """
+    logging.info("Initializing tool discovery state.")
+    return {
+        "subcommand_queue": [[]],  # Start with root (no subcommand)
+        "processed_subcommands": [],
+        "aggregated_commands": [],
+        "done": False,
     }
+
+def call_tool_help_node(state: ToolDiscoveryState) -> dict:
+    """
+    Take the first subcommand path from the queue,
+    call `tool_path <subcommand_path> help` via subprocess,
+    store the output in the state.
+    """
+    new_state = copy.deepcopy(state)
+    queue = new_state["subcommand_queue"]
+    if not queue:
+        return new_state
+
+    sub_path = queue[0]
+    logging.info(f"Processing subcommand path: {sub_path}")
+
+    # Build the command list, e.g. ["bin/kubectl-operator", "cluster", "install", "help"]
+    cmd_list = [new_state["tool_path"]] + sub_path + ["help"]
+    logging.info(f"Running command: {' '.join(cmd_list)}")
+
+    try:
+        completed_proc = subprocess.run(
+            cmd_list,
+            capture_output=True,
+            text=True,
+            check=False  # Don't raise on non-zero exit
+        )
+        new_state["help_output"] = completed_proc.stdout + "\n" + completed_proc.stderr
+        new_state["return_code"] = completed_proc.returncode
+    except Exception as e:
+        logging.error(f"Error running the tool: {e}")
+        new_state["help_output"] = f"Error: {str(e)}"
+        new_state["return_code"] = 1
+
+    return new_state
+
+def parse_tool_help_node(state: ToolDiscoveryState) -> dict:
+    """
+    Parse the help text via the LLM to extract commands, subcommands, flags.
+    Update aggregator and discover new subcommands to enqueue.
+    """
+    new_state = copy.deepcopy(state)
+    help_text = new_state.get("help_output", "")
+    sub_path = new_state["subcommand_queue"][0] if new_state["subcommand_queue"] else []
+
+    prompt = f"""You are an expert at parsing CLI help text. Below is the full help output of a CLI tool for the subcommand path "{' '.join(sub_path)}". 
+Extract a JSON structure with:
+- "name": The command name
+- "description": Brief description
+- Optional "subcommands": list of similar objects
+- Optional "flags": list of objects with "name" and "description"
+Return a valid JSON object with a top-level "commands" list.
+
+Help Output:
+Return only the JSON, nothing else.
+"""
+
+    logging.info("Parsing tool help output with the LLM.")
+    response = llm.invoke([HumanMessage(content=prompt)])
+    content = clean_markdown(response.content)
+
+    try:
+        parsed = json.loads(content)
+        commands_found = parsed.get("commands", [])
+    except Exception as e:
+        logging.warning(f"Failed to parse JSON from LLM: {e}")
+        commands_found = []
+
+    # Merge into aggregator
+    agg = new_state["aggregated_commands"]
+    new_state["aggregated_commands"] = update_aggregated_commands(agg, commands_found)
+
+    logging.info("Aggregated commands after parsing:")
+    logging.info(json.dumps(new_state["aggregated_commands"], indent=2))
+
+    # Gather subcommands found; queue them
+    def collect_subcommands(cmd_list: List[dict], current_path: List[str]) -> List[List[str]]:
+        new_paths = []
+        for c in cmd_list:
+            name = c.get("name")
+            subcmds = c.get("subcommands", [])
+            if name:
+                new_paths.append(current_path + [name])
+            if subcmds:
+                deeper_paths = collect_subcommands(subcmds, current_path + [name])
+                new_paths.extend(deeper_paths)
+        return new_paths
+
+    newly_discovered_paths = collect_subcommands(commands_found, sub_path)
+
+    queue = new_state["subcommand_queue"]
+    processed = new_state["processed_subcommands"]
+    for p in newly_discovered_paths:
+        if p not in queue and p not in processed:
+            queue.append(p)
+
+    return new_state
+
+def mark_subcommand_processed_node(state: ToolDiscoveryState) -> dict:
+    """
+    Remove the front subcommand path from the queue and put it into processed_subcommands.
+    """
+    new_state = copy.deepcopy(state)
+    if new_state["subcommand_queue"]:
+        processed_sub = new_state["subcommand_queue"].pop(0)
+        new_state["processed_subcommands"].append(processed_sub)
+    return new_state
+
+def check_done_node(state: ToolDiscoveryState) -> dict:
+    """
+    If the queue is empty, set done=True, else False.
+    """
+    if not state["subcommand_queue"]:
+        state["done"] = True
+    else:
+        state["done"] = False
+    return state
+
+########################################
+# Build the Graph
+########################################
+
+def build_graph() -> StateGraph:
+    g = StateGraph(ToolDiscoveryState)
+
+    g.add_node("init", init_state_node)
+    g.add_node("call_tool_help", call_tool_help_node)
+    g.add_node("parse_help", parse_tool_help_node)
+    g.add_node("mark_processed", mark_subcommand_processed_node)
+    g.add_node("check_done", check_done_node)
+
+    # Workflow:
+    # 1) init -> call_tool_help
+    # 2) call_tool_help -> parse_help
+    # 3) parse_help -> mark_processed
+    # 4) mark_processed -> check_done
+    # 5) check_done -> either done or back to call_tool_help
+
+    g.set_entry_point("init")
+    g.add_edge("init", "call_tool_help")
+    g.add_edge("call_tool_help", "parse_help")
+    g.add_edge("parse_help", "mark_processed")
+    g.add_edge("mark_processed", "check_done")
+
+    def condition(state: ToolDiscoveryState) -> str:
+        return "finish" if state.get("done") else "continue"
+
+    g.add_conditional_edges("check_done", condition, {
+        "finish": END,
+        "continue": "call_tool_help"
+    })
+
+    return g.compile()
+
+########################################
+# Main
+########################################
+
+if __name__ == "__main__":
+    # Start with a single tool: "bin/kubectl-operator"
+    initial_state: ToolDiscoveryState = {
+        "tool_path": "bin/kubectl-operator",
+        "subcommand_queue": [],
+        "processed_subcommands": [],
+        "aggregated_commands": [],
+        "done": False,
+    }
+
     graph = build_graph()
+
     try:
         result = graph.invoke(initial_state)
-        print("=== Final Result ===")
-        print(result)
+        # Wrap the aggregator in the final JSON with tool path at the top
+        final_output = {
+            "tool": result["tool_path"],
+            "commands": result.get("aggregated_commands", [])
+        }
+        print("=== Final Discovered CLI Structure ===")
+        print(json.dumps(final_output, indent=2))
     except Exception as e:
-        print("Graph execution error:", str(e))
+        logging.error(f"Graph execution error: {e}")
