@@ -103,6 +103,10 @@ class ToolDiscoveryState(TypedDict, total=False):
     help_output: str  # added to store help output
     return_code: int  # added to store return code
     cached: bool  # flag indicating if cache was loaded
+    human_command: str  # natural language query from the human
+    tool_call: dict  # JSON output from the THINK step
+    act_output: str  # output from executing the tool call
+    quit: bool  # flag to exit human interaction loop
 
 
 ########################################
@@ -110,23 +114,19 @@ class ToolDiscoveryState(TypedDict, total=False):
 ########################################
 
 def init_state_node(state: ToolDiscoveryState) -> dict:
-    """
-    Initialize the queue with the empty sub_path (root).
-    Keep the existing root_command from the initial state,
-    which has already been set to name=basename(tool_path).
-    """
     logging.info("Initializing tool discovery state.")
     state["cached"] = False
+    state["quit"] = False
     return {
         "subcommand_queue": [[]],
         "processed_subcommands": [],
         "root_command": state["root_command"],
         "done": False,
-        "cached": state["cached"]
+        "cached": state["cached"],
+        "quit": state["quit"]
     }
 
 
-# New node: Check for cached output and load it if available.
 def cache_check_node(state: ToolDiscoveryState) -> dict:
     new_state = copy.deepcopy(state)
     cache_dir = "tool_info"
@@ -150,22 +150,14 @@ def cache_check_node(state: ToolDiscoveryState) -> dict:
 
 
 def call_tool_help_node(state: ToolDiscoveryState) -> dict:
-    """
-    Pop the first subcommand path from the queue,
-    run `tool_path ...sub_path... help` via subprocess,
-    store the output.
-    """
     new_state = copy.deepcopy(state)
     queue = new_state["subcommand_queue"]
     if not queue:
         return new_state
-
     sub_path = queue[0]
     logging.info(f"Processing subcommand path: {sub_path}")
-
     cmd_list = [new_state["tool_path"]] + sub_path + ["help"]
     logging.info(f"Running command: {' '.join(cmd_list)}")
-
     try:
         completed_proc = subprocess.run(
             cmd_list,
@@ -179,25 +171,17 @@ def call_tool_help_node(state: ToolDiscoveryState) -> dict:
         logging.error(f"Error running the tool: {e}")
         new_state["help_output"] = f"Error: {str(e)}"
         new_state["return_code"] = 1
-
     return new_state
 
 
 def parse_tool_help_node(state: ToolDiscoveryState) -> dict:
-    """
-    Pass the help text to the LLM with robust instructions
-    so it can extract subcommands from 'Available Commands:' or 'Usage:' sections.
-    Then integrate them into the aggregator and discover new subcommands to queue.
-    """
     new_state = copy.deepcopy(state)
     queue = new_state["subcommand_queue"]
     if not queue:
         return new_state
-
     sub_path = queue[0]
     help_text = new_state.get("help_output", "")
     root_cmd = new_state["root_command"]
-
     prompt = f"""You are an expert at extracting CLI structure from help text. 
 We have a command path: {' '.join(sub_path)}. 
 
@@ -238,20 +222,16 @@ No extra commentary.
     logging.info("Parsing tool help output with the LLM.")
     response = llm.invoke([HumanMessage(content=prompt)])
     content = clean_markdown(response.content)
-
     try:
         parsed = json.loads(content)
         commands_found = parsed.get("commands", [])
     except Exception as e:
         logging.warning(f"Failed to parse JSON from LLM: {e}")
         commands_found = []
-
     if not commands_found:
         logging.info("No subcommands or flags discovered.")
         return new_state
-
     current_cmd_data = commands_found[0]
-
     if len(sub_path) == 0:
         desc = current_cmd_data.get("description", "")
         if desc:
@@ -315,7 +295,6 @@ No extra commentary.
                 logging.warning(f"Skipping potential self-cycle path: {p}")
                 continue
             new_state["subcommand_queue"].append(p)
-
     logging.info("Aggregated commands after parsing:")
     logging.info(json.dumps(new_state["root_command"], indent=2))
     return new_state
@@ -337,7 +316,7 @@ def check_done_node(state: ToolDiscoveryState) -> dict:
     return state
 
 
-# New node: trial the tool call using a function-calling LLM.
+# Unused trial node remains.
 def trial_tool_call_node(state: ToolDiscoveryState) -> dict:
     new_state = copy.deepcopy(state)
     tool_desc_json = json.dumps(new_state["root_command"], indent=2)
@@ -352,14 +331,11 @@ Return only a valid JSON object representing the tool call with keys "tool", "fu
 """
     logging.info("Trial tool call prompt:")
     logging.info(prompt)
-
     trial_llm = ChatOpenAI(model="gpt-4o-mini-2024-07-18", temperature=0, verbose=True)
     response = trial_llm.invoke([HumanMessage(content=prompt)])
     content = clean_markdown(response.content)
-
     logging.info("Trial tool call LLM response:")
     logging.info(content)
-
     try:
         new_state["tool_call"] = json.loads(content)
     except Exception as e:
@@ -368,7 +344,86 @@ Return only a valid JSON object representing the tool call with keys "tool", "fu
     return new_state
 
 
-# New node: write the final result to cache.
+# New node: Human interaction.
+def human_interaction_node(state: ToolDiscoveryState) -> dict:
+    new_state = copy.deepcopy(state)
+    user_input = input("How can I help you manage operators or cluster extensions? (or 'quit' to exit): ")
+    if user_input.strip().lower() == "quit":
+        new_state["quit"] = True
+    else:
+        new_state["human_command"] = user_input.strip()
+    return new_state
+
+
+# New node: THINK step - process human natural language into a structured tool call.
+def think_node(state: ToolDiscoveryState) -> dict:
+    new_state = copy.deepcopy(state)
+    if "human_command" not in new_state or not new_state["human_command"]:
+        logging.warning("No human command provided to THINK step.")
+        return new_state
+    # Provide the full JSON summary of the tool.
+    tool_summary = json.dumps(new_state["root_command"], indent=2)
+    prompt = f"""You are an expert at formulating tool calls for managing operators or cluster extensions.
+Below is the JSON summary of the tool, which describes all available commands and flags:
+{tool_summary}
+
+The human query is:
+{new_state['human_command']}
+
+Your task: Based on the JSON summary, generate a tool call that uses one of the valid commands from the summary to answer the human query. 
+Return only a valid JSON object representing the tool call with keys "tool", "function", and "arguments". 
+Do not include any extra commentary.
+"""
+    logging.info("THINK node prompt generated (full JSON summary provided).")
+    think_llm = ChatOpenAI(model="gpt-4o-mini-2024-07-18", temperature=0, verbose=True)
+    response = think_llm.invoke([HumanMessage(content=prompt)])
+    content = clean_markdown(response.content)
+    logging.info("THINK node LLM response:")
+    logging.info(content)
+    try:
+        new_state["tool_call"] = json.loads(content)
+    except Exception as e:
+        logging.warning(f"Failed to parse THINK node tool call JSON: {e}")
+        new_state["tool_call"] = None
+    return new_state
+
+
+# Modified ACT node: execute the structured tool call.
+def act_node(state: ToolDiscoveryState) -> dict:
+    new_state = copy.deepcopy(state)
+    if "tool_call" not in new_state or not new_state["tool_call"]:
+        new_state["act_output"] = "No valid tool call generated."
+        return new_state
+    tool_call = new_state["tool_call"]
+    function = tool_call.get("function", "")
+    arguments = tool_call.get("arguments", [])
+    # If arguments is a dict, flatten it into a list of command-line arguments.
+    if isinstance(arguments, dict):
+        flat_args = []
+        for k, v in arguments.items():
+            flat_args.append(str(k))
+            if not (isinstance(v, bool) and v is True):
+                flat_args.append(str(v))
+        arguments = flat_args
+    elif not isinstance(arguments, list):
+        arguments = [str(arguments)]
+    cmd_list = [new_state["tool_path"], function] + arguments
+    logging.info(f"Executing command: {' '.join(cmd_list)}")
+    try:
+        proc = subprocess.run(cmd_list, capture_output=True, text=True, check=False)
+        new_state["act_output"] = proc.stdout + "\n" + proc.stderr
+    except Exception as e:
+        new_state["act_output"] = f"Error: {str(e)}"
+    return new_state
+
+
+# New node: Observe the result.
+def observe_node(state: ToolDiscoveryState) -> dict:
+    logging.info("Observation: " + state.get("act_output", ""))
+    return state
+
+
+# New node: Write the final result to cache.
 def cache_write_node(state: ToolDiscoveryState) -> dict:
     new_state = copy.deepcopy(state)
     cache_dir = "tool_info"
@@ -397,41 +452,52 @@ def cache_write_node(state: ToolDiscoveryState) -> dict:
 
 def build_graph() -> StateGraph:
     g = StateGraph(ToolDiscoveryState)
-
     g.add_node("init", init_state_node)
     g.add_node("cache_check", cache_check_node)
     g.add_node("call_tool_help", call_tool_help_node)
     g.add_node("parse_help", parse_tool_help_node)
     g.add_node("mark_processed", mark_subcommand_processed_node)
     g.add_node("check_done", check_done_node)
-    g.add_node("trial_tool_call", trial_tool_call_node)
+    g.add_node("trial_tool_call", trial_tool_call_node)  # Unused in current flow.
     g.add_node("cache_write", cache_write_node)
+    g.add_node("human_interaction", human_interaction_node)
+    g.add_node("think", think_node)
+    g.add_node("act", act_node)
+    g.add_node("observe", observe_node)
 
     g.set_entry_point("init")
 
-    # Use conditional edge right after cache_check.
     def cache_condition(state: ToolDiscoveryState) -> str:
         return "finish" if state.get("done") else "continue"
 
     g.add_edge("init", "cache_check")
     g.add_conditional_edges("cache_check", cache_condition, {
-        "finish": "trial_tool_call",
+        "finish": "cache_write",
         "continue": "call_tool_help"
     })
     g.add_edge("call_tool_help", "parse_help")
     g.add_edge("parse_help", "mark_processed")
-    g.add_edge("mark_processed", "check_done")
 
-    def condition(state: ToolDiscoveryState) -> str:
+    def discovery_condition(state: ToolDiscoveryState) -> str:
         return "finish" if state.get("done") else "continue"
 
-    g.add_conditional_edges("check_done", condition, {
-        "finish": "trial_tool_call",
-        "continue": "call_tool_help"
+    g.add_conditional_edges("mark_processed", discovery_condition, {
+        "finish": "cache_write",
+        "continue": "check_done"
     })
-    g.add_edge("trial_tool_call", "cache_write")
-    g.add_edge("cache_write", END)
+    g.add_edge("check_done", "call_tool_help")
+    g.add_edge("cache_write", "human_interaction")
+    g.add_edge("human_interaction", "think")
+    g.add_edge("think", "act")
+    g.add_edge("act", "observe")
 
+    def human_loop(state: ToolDiscoveryState) -> str:
+        return "continue" if not state.get("quit", False) else "finish"
+
+    g.add_conditional_edges("observe", human_loop, {
+        "continue": "human_interaction",
+        "finish": END
+    })
     return g.compile()
 
 
@@ -440,12 +506,9 @@ def build_graph() -> StateGraph:
 ########################################
 
 if __name__ == "__main__":
-    # tools we want to discover how to use, from their help systems:
     tools = ["bin/kubectl-operator"]
-
     graph = build_graph()
     results = []
-
     for tool_path in tools:
         tool_basename = os.path.basename(tool_path)
         initial_state: ToolDiscoveryState = {
