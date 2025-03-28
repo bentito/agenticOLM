@@ -28,21 +28,22 @@ from langgraph.graph import StateGraph, START, END
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0, verbose=False)
 
-########################################
-# Tools and specialized help calls
-########################################
-
+# Tools to discover
 TOOL_PATHS = [
     "bin/kubectl-operator",
     "/usr/bin/grep",
-    "/opt/homebrew/bin/kubectl"  # example of a third tool
+    "/opt/homebrew/bin/kubectl"
 ]
 
+# If a tool requires a special way of calling help, define it here.
 HELP_CALL_MAP = {
     "bin/kubectl-operator": "subcommand",
     "/usr/bin/grep": "flag",
-    "/opt/homebrew/bin/kubectl": "subcommand",
+    "/opt/homebrew/bin/kubectl": "subcommand"
 }
+
+# Maximum subcommands to discover per tool
+MAX_SUBCOMMANDS_PER_TOOL = 20
 
 
 def flush_all():
@@ -176,7 +177,7 @@ def collect_subcommands(cmd_obj: dict, base_path: List[str]) -> List[List[str]]:
 
 
 ########################################
-# Integrating the discovered structure
+# Integrating discovered structure
 ########################################
 
 def integrate_parsed_help(
@@ -185,8 +186,14 @@ def integrate_parsed_help(
         parsed_help: dict,
         processed_subcommands: List[List[str]],
         visited_subcommands: set,
-        subcommand_queue: List[List[str]]
+        subcommand_queue: List[List[str]],
+        discovered_counts: Dict[str, int],
+        tool_path: str
 ):
+    """
+    This merges parsed_help into root_cmd at sub_path,
+    skipping or limiting if we've discovered enough subcommands for this tool.
+    """
     commands_found = parsed_help.get("commands", [])
     if not commands_found:
         logging.info("No commands found in parse.")
@@ -210,7 +217,6 @@ def integrate_parsed_help(
             root_cmd["subcommands"] = []
         if "subcommands" in current_cmd_data:
             root_cmd["subcommands"] = current_cmd_data["subcommands"]
-
     else:
         # find or create the subcommand in the existing structure
         parent_path = sub_path[:-1]
@@ -264,21 +270,26 @@ def integrate_parsed_help(
                 found_child.update(child_sub)
 
     newly_discovered = collect_subcommands(current_cmd_data, sub_path)
+
+    # limit subcommands for this tool if we've discovered enough
     for nd in newly_discovered:
-        # 1) skip if "help" is in path
         if "help" in nd:
             logging.info(f"Skipping 'help' sub-path to avoid recursion: {nd}")
             continue
 
-        # 2) skip if visited
         path_tuple = tuple(nd)
         if path_tuple in visited_subcommands:
             logging.info(f"Already visited {nd}, skipping.")
             continue
 
-        # Otherwise mark visited & enqueue
-        visited_subcommands.add(path_tuple)
+        # Check the discovered count for this tool
+        if discovered_counts[tool_path] >= MAX_SUBCOMMANDS_PER_TOOL:
+            logging.info(f"Max subcommands reached for {tool_path} => skipping {nd}")
+            continue
 
+        # If not visited and we haven't hit the limit, enqueue
+        visited_subcommands.add(path_tuple)
+        discovered_counts[tool_path] += 1
         if nd not in subcommand_queue and nd not in processed_subcommands:
             subcommand_queue.append(nd)
 
@@ -293,7 +304,8 @@ class MasterState(TypedDict, total=False):
     current_tool_index: int
     subcommand_queue: List[List[str]]
     processed_subcommands: List[List[str]]
-    visited_subcommands: set  # The set of all subcmd paths we've visited
+    visited_subcommands: set
+    discovered_counts: Dict[str, int]  # how many subcommands found so far per tool
     done_discovery: bool
     user_query: str
     quit: bool
@@ -317,7 +329,9 @@ def init_state_node(state: MasterState) -> Dict[str, Any]:
     new_state["current_tool_index"] = 0
     new_state["subcommand_queue"] = [[]]
     new_state["processed_subcommands"] = []
-    new_state["visited_subcommands"] = set()  # track all visited subcmd paths
+    new_state["visited_subcommands"] = set()
+    # discovered_counts => 0 for each tool
+    new_state["discovered_counts"] = {t: 0 for t in new_state["tools"]}
     new_state["done_discovery"] = False
     new_state["quit"] = False
     new_state["help_output"] = ""
@@ -342,8 +356,11 @@ def check_cache_node(state: MasterState) -> Dict[str, Any]:
             cached_data = json.load(f)
         if "commands" in cached_data and len(cached_data["commands"]) > 0:
             new_state["discovered_structs"][tool_path] = cached_data["commands"][0]
+        # skip discovery for this tool
         new_state["subcommand_queue"] = []
         new_state["processed_subcommands"] = []
+        new_state["visited_subcommands"] = set()
+        new_state["discovered_counts"][tool_path] = MAX_SUBCOMMANDS_PER_TOOL  # effectively skip
     else:
         tool_basename = os.path.basename(tool_path)
         root_cmd = {
@@ -355,6 +372,8 @@ def check_cache_node(state: MasterState) -> Dict[str, Any]:
         new_state["discovered_structs"][tool_path] = root_cmd
         new_state["subcommand_queue"] = [[]]
         new_state["processed_subcommands"] = []
+        new_state["visited_subcommands"] = set()  # reset
+        new_state["discovered_counts"][tool_path] = 0
     return new_state
 
 
@@ -382,13 +401,16 @@ def parse_tool_help_node(state: MasterState) -> Dict[str, Any]:
     root_command = new_state["discovered_structs"][tool_path]
 
     parsed_help = parse_help_text_with_llm(sub_path, help_output)
+
     integrate_parsed_help(
         root_cmd=root_command,
         sub_path=sub_path,
         parsed_help=parsed_help,
         processed_subcommands=new_state["processed_subcommands"],
         visited_subcommands=new_state["visited_subcommands"],
-        subcommand_queue=new_state["subcommand_queue"]
+        subcommand_queue=new_state["subcommand_queue"],
+        discovered_counts=new_state["discovered_counts"],
+        tool_path=tool_path
     )
     return new_state
 
@@ -403,9 +425,8 @@ def mark_subcommand_processed_node(state: MasterState) -> Dict[str, Any]:
 
 def queue_new_subs_node(state: MasterState) -> Dict[str, Any]:
     """
-    (Optional) This node is not strictly necessary if we do everything in integrate_parsed_help,
-    but let's keep it for clarity. We'll ensure newly discovered subcommands are
-    already queued by integrate_parsed_help, so we might do nothing here.
+    We do all the subcommand queueing in integrate_parsed_help,
+    so this node might be a no-op. We'll keep it for clarity.
     """
     return state
 
@@ -430,9 +451,13 @@ def check_done_tool_node(state: MasterState) -> Dict[str, Any]:
         if new_state["current_tool_index"] >= len(new_state["tools"]):
             new_state["done_discovery"] = True
         else:
+            # reset for next tool
+            next_tool = new_state["tools"][new_state["current_tool_index"]]
             new_state["subcommand_queue"] = [[]]
             new_state["processed_subcommands"] = []
             new_state["visited_subcommands"] = set()
+            if new_state["discovered_counts"].get(next_tool) is None:
+                new_state["discovered_counts"][next_tool] = 0
     return new_state
 
 
@@ -441,7 +466,7 @@ def check_all_tools_done_node(state: MasterState) -> Dict[str, Any]:
 
 
 ########################################
-# Now the user query portion
+# User loop
 ########################################
 
 def user_interaction_node(state: MasterState) -> Dict[str, Any]:
@@ -462,7 +487,6 @@ def think_node(state: MasterState) -> Dict[str, Any]:
         logging.info("No user query found.")
         return new_state
 
-    # Build a big JSON summary from discovered_structs
     all_tools_summary = []
     for tpath, struct in new_state["discovered_structs"].items():
         all_tools_summary.append(struct)
@@ -470,10 +494,9 @@ def think_node(state: MasterState) -> Dict[str, Any]:
             "You are a helpful CLI orchestrator. We have these tools discovered:\n\n"
             + json.dumps(all_tools_summary, indent=2)
             + "\n\n"
-              "You may combine these tools. For example, you can run a command in 'kubectl-operator' "
-              "and pipe its output into 'grep', or use '/opt/homebrew/bin/kubectl'. "
-              "Please produce a valid JSON structure with the top-level key `tool_sequence`. "
-              "Each step is an object with `tool_path` and `arguments` to run that tool. For a pipe, just put multiple steps.\n\n"
+              "You may combine these tools (kubectl-operator, grep, kubectl, etc.). "
+              "Please produce a valid JSON structure with top-level key `tool_sequence`. "
+              "Each step is an object with `tool_path` and `arguments`. For a pipe, just put multiple steps.\n\n"
               "The user request is: "
             + new_state["user_query"]
             + "\n\n"
@@ -554,7 +577,7 @@ def observe_node(state: MasterState) -> Dict[str, Any]:
 User's request: "{user_query}"
 CLI output:
 {last_output}
-Explain to the user in 1-3 lines what this result indicates and whether more steps might be needed.
+Explain in 1-3 lines what this result indicates and whether more steps might be needed.
 Plain text only, no JSON.
 """
         interpret_response = llm.invoke([HumanMessage(content=interpretation_prompt)])
@@ -623,13 +646,12 @@ def build_graph() -> StateGraph:
     })
 
     g.add_edge("check_done_tool", "check_all_tools_done")
-
     g.add_conditional_edges("check_all_tools_done", all_tools_done_cond, {
         "done": "user_interact",
         "continue": "check_cache"
     })
 
-    # User loop
+    # user loop
     def quit_cond(state: MasterState) -> str:
         if state.get("quit"):
             return "exit"
@@ -674,7 +696,7 @@ if __name__ == "__main__":
         "done_discovery": False
     }
     config = {
-        "recursion_limit": 500,  # can raise the limit if needed
+        "recursion_limit": 500,  # raise if needed
         "configurable": {"thread_id": "multi-tool-thread"}
     }
     result_state = graph.invoke(initial_state, config)
