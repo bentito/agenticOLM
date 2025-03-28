@@ -1,6 +1,6 @@
 import os
 
-# Force Python to run unbuffered (like python -u)
+# Force unbuffered mode so logs and prints appear immediately:
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 import sys
@@ -11,8 +11,6 @@ import subprocess
 from typing import List, Dict, Any
 from typing_extensions import TypedDict
 
-# If your environment re-imports or resets logging, you might do it AFTER
-# setting PYTHONUNBUFFERED. We'll reconfigure logging to use stdout explicitly:
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 for h in logger.handlers:
@@ -21,7 +19,6 @@ stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setLevel(logging.INFO)
 logger.addHandler(stream_handler)
 
-# Now do the rest of your imports
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
@@ -30,12 +27,7 @@ from langgraph.graph import StateGraph, START, END
 # Setup
 ########################################
 
-# The main LLM used for both discovery and user queries.
 llm = ChatOpenAI(model="gpt-4o", temperature=0, verbose=False)
-
-########################################
-# Tools and their specialized help calls
-########################################
 
 TOOL_PATHS = ["bin/kubectl-operator", "/usr/bin/grep"]
 
@@ -45,17 +37,9 @@ HELP_CALL_MAP = {
 }
 
 
-########################################
-# Flush Utility
-########################################
-
 def flush_all():
-    """
-    Flush stdout and all log handlers.
-    This helps ensure messages appear immediately in most terminals.
-    """
+    """Flush stdout and logging to ensure immediate display."""
     sys.stdout.flush()
-    # Also flush any logging handler. We set all to stdout above, so this is mostly redundant.
     for handler in logging.getLogger().handlers:
         try:
             handler.flush()
@@ -150,18 +134,17 @@ def parse_help_text_with_llm(sub_path: List[str], help_text: str) -> dict:
 We have a command path: {' '.join(sub_path)}.
 
 Your job:
-1. Read the help text below carefully for lines about usage, available commands, flags.
-2. Identify subcommands and flags.
-3. Return a JSON with a top-level "commands" array containing exactly one object:
+1. Read the help text below for usage, commands, flags.
+2. Return a JSON with a top-level "commands" array of exactly one object:
    {{
-     "name": "<the command name for this path>",
-     "description": "<short desc>",
-     "subcommands": [ ... ],
-     "flags": [ {{ "name": "...", "description": "..." }} ]
+     "name": "...",
+     "description": "...",
+     "subcommands": [...],
+     "flags": [...]
    }}
 Help Output:
 {help_text}
-Return only the valid JSON.
+Only output valid JSON.
 """
     response = llm.invoke([HumanMessage(content=prompt)])
     content = clean_markdown(response.content)
@@ -260,6 +243,7 @@ class MasterState(TypedDict, total=False):
     return_code: int
     tool_sequence: List[Dict[str, Any]]
     tool_output: str
+    interpretation: str  # We'll store the LLM's interpretive text here.
 
 
 ########################################
@@ -280,6 +264,7 @@ def init_state_node(state: MasterState) -> Dict[str, Any]:
     new_state["return_code"] = 0
     new_state["tool_sequence"] = []
     new_state["tool_output"] = ""
+    new_state["interpretation"] = ""
     return new_state
 
 
@@ -297,6 +282,7 @@ def check_cache_node(state: MasterState) -> Dict[str, Any]:
             cached_data = json.load(f)
         if "commands" in cached_data and len(cached_data["commands"]) > 0:
             new_state["discovered_structs"][tool_path] = cached_data["commands"][0]
+        # skip discovery
         new_state["subcommand_queue"] = []
         new_state["processed_subcommands"] = []
     else:
@@ -404,7 +390,7 @@ def think_node(state: MasterState) -> Dict[str, Any]:
     if new_state.get("quit"):
         return new_state
     if not new_state.get("user_query"):
-        logging.warning("No user query found.")
+        logging.info("No user query found.")
         return new_state
 
     all_tools_summary = []
@@ -414,20 +400,16 @@ def think_node(state: MasterState) -> Dict[str, Any]:
             "You are a helpful CLI orchestrator. We have these tools discovered:\n\n"
             + json.dumps(all_tools_summary, indent=2)
             + "\n\n"
-              "You may combine these tools. For example, you can run a command in 'kubectl-operator' "
-              "and then pipe its output to 'grep'. Or just use 'grep' alone. Please produce a valid JSON "
-              "structure with the top-level key `tool_sequence` (a list of steps). Each step is an object "
-              "with `tool_path` and `arguments` to run that tool. For a pipe, just put multiple steps.\n\n"
+              "You may combine these tools (e.g. pipe output from 'kubectl-operator' into 'grep'). "
+              "Please produce valid JSON with the top-level key `tool_sequence`. Each step is an object "
+              "with `tool_path` and `arguments`.\n\n"
               "The user request is: "
             + new_state["user_query"]
             + "\n\n"
-              "Return ONLY the JSON, no extra text. The JSON format:\n"
+              "Return ONLY the JSON, no extra commentary. Format:\n"
               "{\n"
               "  \"tool_sequence\": [\n"
-              "    {\n"
-              "      \"tool_path\": \"...\",\n"
-              "      \"arguments\": [\"...\",\"...\"]\n"
-              "    },\n"
+              "    {\"tool_path\": \"...\", \"arguments\": [\"...\", \"...\"]},\n"
               "    ...\n"
               "  ]\n"
               "}"
@@ -488,10 +470,36 @@ def act_node(state: MasterState) -> Dict[str, Any]:
 
 
 def observe_node(state: MasterState) -> Dict[str, Any]:
+    """
+    After executing tool calls, we show the final output
+    and also run another LLM call to interpret it for the user.
+    """
+    new_state = dict(state)
+
     logging.info("FINAL OUTPUT:")
-    print(state.get("tool_output", "No output"), flush=True)
+    print(new_state.get("tool_output", "No output"), flush=True)
     flush_all()
-    return state
+
+    # Call the LLM again to interpret the final output and see if we are done or next steps.
+    last_output = new_state.get("tool_output", "").strip()
+    user_query = new_state.get("user_query", "").strip()
+    if last_output:
+        # Let's prompt the LLM for a short interpretation:
+        interpretation_prompt = f"""You are an assistant summarizing CLI tool output.
+User's request: "{user_query}"
+CLI output:
+{last_output}
+Explain to the user in 1-3 lines what this result indicates and whether more steps might be needed.
+Plain text only, no JSON.
+"""
+        interpret_response = llm.invoke([HumanMessage(content=interpretation_prompt)])
+        interpretation = interpret_response.content.strip()
+        new_state["interpretation"] = interpretation
+
+        logging.info("INTERPRETATION:")
+        print(interpretation, flush=True)
+
+    return new_state
 
 
 def finish_node(state: MasterState) -> Dict[str, Any]:
@@ -590,8 +598,6 @@ def build_graph() -> StateGraph:
 ########################################
 
 if __name__ == "__main__":
-    # If your shell/IDE doesn't respect PYTHONUNBUFFERED for some reason,
-    # also run with python -u <script> or set PYTHONUNBUFFERED=1 externally.
     graph = build_graph()
     initial_state: MasterState = {
         "tools": TOOL_PATHS,
