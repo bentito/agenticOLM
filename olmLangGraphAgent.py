@@ -1,7 +1,6 @@
 import os
 
-# Force unbuffered mode so logs and prints appear immediately:
-os.environ["PYTHONUNBUFFERED"] = "1"
+os.environ["PYTHONUNBUFFERED"] = "1"  # Force unbuffered output
 
 import sys
 import json
@@ -29,16 +28,24 @@ from langgraph.graph import StateGraph, START, END
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0, verbose=False)
 
-TOOL_PATHS = ["bin/kubectl-operator", "/usr/bin/grep"]
+########################################
+# Tools and specialized help calls
+########################################
+
+TOOL_PATHS = [
+    "bin/kubectl-operator",
+    "/usr/bin/grep",
+    "/opt/homebrew/bin/kubectl"  # example of a third tool
+]
 
 HELP_CALL_MAP = {
     "bin/kubectl-operator": "subcommand",
-    "/usr/bin/grep": "flag"
+    "/usr/bin/grep": "flag",
+    "/opt/homebrew/bin/kubectl": "subcommand",
 }
 
 
 def flush_all():
-    """Flush stdout and logging to ensure immediate display."""
     sys.stdout.flush()
     for handler in logging.getLogger().handlers:
         try:
@@ -97,7 +104,7 @@ def ensure_command_in_path(cmd: dict, path: List[str]) -> dict:
                 found = sc
                 break
         if not found:
-            new_sub = {"name": part, "description": "", "subcommands": []}
+            new_sub = {"name": part, "description": "", "subcommands": [], "flags": []}
             current["subcommands"].append(new_sub)
             found = new_sub
         current = found
@@ -108,7 +115,7 @@ def run_help_command(tool_path: str, sub_path: List[str]) -> (str, int):
     style = HELP_CALL_MAP.get(tool_path, "subcommand")
     if style == "subcommand":
         cmd_list = [tool_path] + sub_path + ["help"]
-    else:
+    else:  # "flag"
         cmd_list = [tool_path, "--help"]
 
     logging.info(f"Running command: {' '.join(cmd_list)}")
@@ -121,7 +128,7 @@ def run_help_command(tool_path: str, sub_path: List[str]) -> (str, int):
             timeout=10
         )
         return (completed_proc.stdout + "\n" + completed_proc.stderr, completed_proc.returncode)
-    except subprocess.TimeoutExpired as te:
+    except subprocess.TimeoutExpired:
         logging.error(f"Tool help command timed out: {cmd_list}")
         return (f"Timed out after 10s: {cmd_list}", 1)
     except Exception as e:
@@ -130,12 +137,12 @@ def run_help_command(tool_path: str, sub_path: List[str]) -> (str, int):
 
 
 def parse_help_text_with_llm(sub_path: List[str], help_text: str) -> dict:
-    prompt = f"""You are an expert at extracting CLI structure from help text. 
+    prompt = f"""You are an expert at extracting CLI structure from help text.
 We have a command path: {' '.join(sub_path)}.
 
 Your job:
-1. Read the help text below for usage, commands, flags.
-2. Return a JSON with a top-level "commands" array of exactly one object:
+1. Read the help text for usage, commands, flags.
+2. Return JSON with a top-level "commands" array containing exactly one object:
    {{
      "name": "...",
      "description": "...",
@@ -157,47 +164,78 @@ Only output valid JSON.
 
 def collect_subcommands(cmd_obj: dict, base_path: List[str]) -> List[List[str]]:
     new_paths = []
-    for sc in cmd_obj.get("subcommands", []):
+    subcmds = cmd_obj.get("subcommands", [])
+    for sc in subcmds:
         name = sc.get("name")
         if not name:
             continue
         candidate_path = base_path + [name]
         new_paths.append(candidate_path)
-        new_paths += collect_subcommands(sc, candidate_path)
+        new_paths.extend(collect_subcommands(sc, candidate_path))
     return new_paths
 
 
+########################################
+# Integrating the discovered structure
+########################################
+
 def integrate_parsed_help(
-        root_cmd: dict, sub_path: List[str], parsed_help: dict, processed: List[List[str]]
-) -> None:
+        root_cmd: dict,
+        sub_path: List[str],
+        parsed_help: dict,
+        processed_subcommands: List[List[str]],
+        visited_subcommands: set,
+        subcommand_queue: List[List[str]]
+):
     commands_found = parsed_help.get("commands", [])
     if not commands_found:
         logging.info("No commands found in parse.")
         return
 
     current_cmd_data = commands_found[0]
+
+    # If sub_path is empty => merge at the root command
     if len(sub_path) == 0:
         desc = current_cmd_data.get("description", "")
         if desc:
             root_cmd["description"] = desc
+
         new_flags = current_cmd_data.get("flags", [])
+        if "flags" not in root_cmd:
+            root_cmd["flags"] = []
         old_flags = root_cmd.get("flags", [])
         root_cmd["flags"] = merge_flags(old_flags, new_flags)
+
+        if "subcommands" not in root_cmd:
+            root_cmd["subcommands"] = []
         if "subcommands" in current_cmd_data:
             root_cmd["subcommands"] = current_cmd_data["subcommands"]
+
     else:
+        # find or create the subcommand in the existing structure
         parent_path = sub_path[:-1]
         this_sub_name = sub_path[-1]
         parent_cmd = ensure_command_in_path(root_cmd, parent_path)
-        sub_list = parent_cmd.get("subcommands", [])
+
+        if "subcommands" not in parent_cmd:
+            parent_cmd["subcommands"] = []
+        sub_list = parent_cmd["subcommands"]
+
+        # locate or create the subcommand
         existing_sub = None
         for sc in sub_list:
             if sc["name"] == this_sub_name:
                 existing_sub = sc
                 break
         if not existing_sub:
-            existing_sub = {"name": this_sub_name, "description": "", "subcommands": []}
+            existing_sub = {
+                "name": this_sub_name,
+                "description": "",
+                "subcommands": [],
+                "flags": []
+            }
             sub_list.append(existing_sub)
+
         old_desc = existing_sub.get("description", "")
         new_desc = current_cmd_data.get("description", "")
         if new_desc and new_desc not in old_desc:
@@ -205,9 +243,14 @@ def integrate_parsed_help(
                 existing_sub["description"] = new_desc
             else:
                 existing_sub["description"] = old_desc + " / " + new_desc
-        old_flags = existing_sub.get("flags", [])
+
+        if "flags" not in existing_sub:
+            existing_sub["flags"] = []
         found_flags = current_cmd_data.get("flags", [])
-        existing_sub["flags"] = merge_flags(old_flags, found_flags)
+        existing_sub["flags"] = merge_flags(existing_sub["flags"], found_flags)
+
+        if "subcommands" not in existing_sub:
+            existing_sub["subcommands"] = []
         for child_sub in current_cmd_data.get("subcommands", []):
             child_name = child_sub["name"]
             found_child = None
@@ -219,10 +262,25 @@ def integrate_parsed_help(
                 existing_sub["subcommands"].append(child_sub)
             else:
                 found_child.update(child_sub)
+
     newly_discovered = collect_subcommands(current_cmd_data, sub_path)
     for nd in newly_discovered:
-        if nd not in processed and nd != sub_path:
-            processed.append(nd)
+        # 1) skip if "help" is in path
+        if "help" in nd:
+            logging.info(f"Skipping 'help' sub-path to avoid recursion: {nd}")
+            continue
+
+        # 2) skip if visited
+        path_tuple = tuple(nd)
+        if path_tuple in visited_subcommands:
+            logging.info(f"Already visited {nd}, skipping.")
+            continue
+
+        # Otherwise mark visited & enqueue
+        visited_subcommands.add(path_tuple)
+
+        if nd not in subcommand_queue and nd not in processed_subcommands:
+            subcommand_queue.append(nd)
 
 
 ########################################
@@ -235,6 +293,7 @@ class MasterState(TypedDict, total=False):
     current_tool_index: int
     subcommand_queue: List[List[str]]
     processed_subcommands: List[List[str]]
+    visited_subcommands: set  # The set of all subcmd paths we've visited
     done_discovery: bool
     user_query: str
     quit: bool
@@ -243,7 +302,7 @@ class MasterState(TypedDict, total=False):
     return_code: int
     tool_sequence: List[Dict[str, Any]]
     tool_output: str
-    interpretation: str  # We'll store the LLM's interpretive text here.
+    interpretation: str
 
 
 ########################################
@@ -258,6 +317,7 @@ def init_state_node(state: MasterState) -> Dict[str, Any]:
     new_state["current_tool_index"] = 0
     new_state["subcommand_queue"] = [[]]
     new_state["processed_subcommands"] = []
+    new_state["visited_subcommands"] = set()  # track all visited subcmd paths
     new_state["done_discovery"] = False
     new_state["quit"] = False
     new_state["help_output"] = ""
@@ -282,7 +342,6 @@ def check_cache_node(state: MasterState) -> Dict[str, Any]:
             cached_data = json.load(f)
         if "commands" in cached_data and len(cached_data["commands"]) > 0:
             new_state["discovered_structs"][tool_path] = cached_data["commands"][0]
-        # skip discovery
         new_state["subcommand_queue"] = []
         new_state["processed_subcommands"] = []
     else:
@@ -321,29 +380,34 @@ def parse_tool_help_node(state: MasterState) -> Dict[str, Any]:
     help_output = new_state.get("help_output", "")
     tool_path = new_state["tools"][new_state["current_tool_index"]]
     root_command = new_state["discovered_structs"][tool_path]
+
     parsed_help = parse_help_text_with_llm(sub_path, help_output)
-    integrate_parsed_help(root_command, sub_path, parsed_help, new_state["processed_subcommands"])
+    integrate_parsed_help(
+        root_cmd=root_command,
+        sub_path=sub_path,
+        parsed_help=parsed_help,
+        processed_subcommands=new_state["processed_subcommands"],
+        visited_subcommands=new_state["visited_subcommands"],
+        subcommand_queue=new_state["subcommand_queue"]
+    )
     return new_state
 
 
 def mark_subcommand_processed_node(state: MasterState) -> Dict[str, Any]:
     new_state = dict(state)
     if new_state["subcommand_queue"]:
-        new_state["subcommand_queue"].pop(0)
+        done_path = new_state["subcommand_queue"].pop(0)
+        new_state["processed_subcommands"].append(done_path)
     return new_state
 
 
 def queue_new_subs_node(state: MasterState) -> Dict[str, Any]:
-    new_state = dict(state)
-    processed = new_state["processed_subcommands"]
-    queued = set(tuple(x) for x in new_state["subcommand_queue"])
-    to_add = []
-    for p in processed:
-        tp = tuple(p)
-        if tp not in queued:
-            to_add.append(p)
-    new_state["subcommand_queue"].extend(to_add)
-    return new_state
+    """
+    (Optional) This node is not strictly necessary if we do everything in integrate_parsed_help,
+    but let's keep it for clarity. We'll ensure newly discovered subcommands are
+    already queued by integrate_parsed_help, so we might do nothing here.
+    """
+    return state
 
 
 def check_done_tool_node(state: MasterState) -> Dict[str, Any]:
@@ -368,12 +432,17 @@ def check_done_tool_node(state: MasterState) -> Dict[str, Any]:
         else:
             new_state["subcommand_queue"] = [[]]
             new_state["processed_subcommands"] = []
+            new_state["visited_subcommands"] = set()
     return new_state
 
 
 def check_all_tools_done_node(state: MasterState) -> Dict[str, Any]:
     return state
 
+
+########################################
+# Now the user query portion
+########################################
 
 def user_interaction_node(state: MasterState) -> Dict[str, Any]:
     flush_all()
@@ -393,6 +462,7 @@ def think_node(state: MasterState) -> Dict[str, Any]:
         logging.info("No user query found.")
         return new_state
 
+    # Build a big JSON summary from discovered_structs
     all_tools_summary = []
     for tpath, struct in new_state["discovered_structs"].items():
         all_tools_summary.append(struct)
@@ -400,16 +470,17 @@ def think_node(state: MasterState) -> Dict[str, Any]:
             "You are a helpful CLI orchestrator. We have these tools discovered:\n\n"
             + json.dumps(all_tools_summary, indent=2)
             + "\n\n"
-              "You may combine these tools (e.g. pipe output from 'kubectl-operator' into 'grep'). "
-              "Please produce valid JSON with the top-level key `tool_sequence`. Each step is an object "
-              "with `tool_path` and `arguments`.\n\n"
+              "You may combine these tools. For example, you can run a command in 'kubectl-operator' "
+              "and pipe its output into 'grep', or use '/opt/homebrew/bin/kubectl'. "
+              "Please produce a valid JSON structure with the top-level key `tool_sequence`. "
+              "Each step is an object with `tool_path` and `arguments` to run that tool. For a pipe, just put multiple steps.\n\n"
               "The user request is: "
             + new_state["user_query"]
             + "\n\n"
               "Return ONLY the JSON, no extra commentary. Format:\n"
               "{\n"
               "  \"tool_sequence\": [\n"
-              "    {\"tool_path\": \"...\", \"arguments\": [\"...\", \"...\"]},\n"
+              "    {\"tool_path\": \"...\", \"arguments\": [\"...\",\"...\"]},\n"
               "    ...\n"
               "  ]\n"
               "}"
@@ -470,21 +541,15 @@ def act_node(state: MasterState) -> Dict[str, Any]:
 
 
 def observe_node(state: MasterState) -> Dict[str, Any]:
-    """
-    After executing tool calls, we show the final output
-    and also run another LLM call to interpret it for the user.
-    """
     new_state = dict(state)
-
     logging.info("FINAL OUTPUT:")
     print(new_state.get("tool_output", "No output"), flush=True)
     flush_all()
 
-    # Call the LLM again to interpret the final output and see if we are done or next steps.
+    # Optional interpretive step
     last_output = new_state.get("tool_output", "").strip()
     user_query = new_state.get("user_query", "").strip()
     if last_output:
-        # Let's prompt the LLM for a short interpretation:
         interpretation_prompt = f"""You are an assistant summarizing CLI tool output.
 User's request: "{user_query}"
 CLI output:
@@ -531,6 +596,7 @@ def build_graph() -> StateGraph:
 
     g.set_entry_point("init")
 
+    # Discovery flow
     def all_tools_done_cond(state: MasterState) -> str:
         return "done" if state.get("done_discovery", False) else "continue"
 
@@ -557,11 +623,13 @@ def build_graph() -> StateGraph:
     })
 
     g.add_edge("check_done_tool", "check_all_tools_done")
+
     g.add_conditional_edges("check_all_tools_done", all_tools_done_cond, {
         "done": "user_interact",
         "continue": "check_cache"
     })
 
+    # User loop
     def quit_cond(state: MasterState) -> str:
         if state.get("quit"):
             return "exit"
@@ -605,7 +673,10 @@ if __name__ == "__main__":
         "current_tool_index": 0,
         "done_discovery": False
     }
-    config = {"recursion_limit": 200, "configurable": {"thread_id": "multi-tool-thread"}}
+    config = {
+        "recursion_limit": 500,  # can raise the limit if needed
+        "configurable": {"thread_id": "multi-tool-thread"}
+    }
     result_state = graph.invoke(initial_state, config)
     logging.info("Graph execution finished.")
     flush_all()
